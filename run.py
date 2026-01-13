@@ -17,7 +17,6 @@ import logging
 # ==========================================
 # ⚙️ CONFIGURATION & PATHS
 # ==========================================
-# อ้างอิง Path จาก Screenshot (โฟลเดอร์ models อยู่ระดับเดียวกับ run.py)
 MODELS = {
     'BOX': {
         'cls': 'models/box_model_production.pth',
@@ -33,7 +32,7 @@ MODELS = {
 
 CONFIDENCE_THRESHOLD = 0.65
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-CAMERA_INDEX = 0  # 📷 ใช้กล้อง 0 ตามสั่ง
+CAMERA_INDEX = 0
 
 # Global State
 CURRENT_MODE = 'BOX'
@@ -42,7 +41,7 @@ ZOOM_STEP = 0.1
 lock = threading.Lock()
 
 # ==========================================
-# 🏗️ MODEL DEFINITION (Strictly Original)
+# 🏗️ MODEL DEFINITION
 # ==========================================
 class ArcMarginProduct(nn.Module):
     def __init__(self, in_features, out_features, s=30.0, m=0.50):
@@ -73,7 +72,7 @@ class PillModelGodTier(nn.Module):
         return emb
 
 # ==========================================
-# 🛠️ HELPER FUNCTIONS (Original Logic)
+# 🛠️ HELPER FUNCTIONS
 # ==========================================
 def get_auto_hsv_bounds(frame, sample_size=30):
     h, w, _ = frame.shape
@@ -115,28 +114,49 @@ class PerformanceMonitor:
                 f"DET: {self.seg_time*1000:.1f}ms | CLS: {self.cls_time*1000:.1f}ms"]
 
 # ==========================================
-# 🚀 SYSTEM INIT & MODEL LOADING
+# 🚀 SYSTEM INIT & MODEL LOADING (FIXED)
 # ==========================================
 app = Flask(__name__)
-loaded_systems = {} # เก็บโมเดลทั้ง Box และ Pill ไว้ในนี้
+loaded_systems = {}
 
 def load_system(mode_name, config):
     print(f"⏳ Loading {mode_name} System...")
     sys_data = {}
     
-    # 1. Load CLS Model (.pth) - ใช้ Logic เดิมเป๊ะๆ
+    # 1. Load Detector (.onnx)
+    if not os.path.exists(config['det']):
+        print(f"❌ {mode_name} DET not found: {config['det']}")
+        return None
+    sys_data['det_model'] = YOLO(config['det'], task='detect')
+
+    # 2. Load CLS Model (.pth) - 🔧 FIX: Trust Weight Shape
     if not os.path.exists(config['cls']):
         print(f"❌ {mode_name} CLS not found: {config['cls']}")
         return None
         
     checkpoint = torch.load(config['cls'], map_location=DEVICE)
+    
+    # Extract Metadata
     class_names = checkpoint.get('class_names', ["Unknown"] * 100)
-    # ถ้าไม่มี img_size ใน checkpoint ให้ใช้จาก config
-    img_size = checkpoint.get('img_size', config['img_size']) 
-    
+    img_size = checkpoint.get('img_size', config['img_size'])
     state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
-    
-    model = PillModelGodTier(num_classes=len(class_names), img_size=img_size).to(DEVICE)
+
+    # 🔧 FIX: Check actual weight shape from state_dict
+    if 'head.weight' in state_dict:
+        real_num_classes = state_dict['head.weight'].shape[0]
+        print(f"   🔧 Auto-fix: Weights have {real_num_classes} classes (Metadata said {len(class_names)})")
+        
+        # Adjust class_names list to match weights (Prevent Crash)
+        if len(class_names) < real_num_classes:
+            diff = real_num_classes - len(class_names)
+            class_names.extend([f"Extra_{i}" for i in range(diff)])
+        elif len(class_names) > real_num_classes:
+            class_names = class_names[:real_num_classes]
+    else:
+        real_num_classes = len(class_names)
+
+    # Init Model with REAL shape
+    model = PillModelGodTier(num_classes=real_num_classes, img_size=img_size).to(DEVICE)
     model.load_state_dict(state_dict, strict=False)
     model.eval()
     
@@ -148,33 +168,29 @@ def load_system(mode_name, config):
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
     
-    # 2. Load Detector (.onnx) via Ultralytics
-    if not os.path.exists(config['det']):
-        print(f"❌ {mode_name} DET not found: {config['det']}")
-        return None
-    sys_data['det_model'] = YOLO(config['det'], task='detect') # บังคับ detect ให้ชัวร์
-    
     print(f"✅ {mode_name} Loaded.")
     return sys_data
 
-# Load Everything at Startup
-loaded_systems['BOX'] = load_system('BOX', MODELS['BOX'])
-loaded_systems['PILL'] = load_system('PILL', MODELS['PILL'])
+# Load Everything
+try:
+    loaded_systems['BOX'] = load_system('BOX', MODELS['BOX'])
+    loaded_systems['PILL'] = load_system('PILL', MODELS['PILL'])
+except Exception as e:
+    print(f"CRITICAL ERROR LOADING MODELS: {e}")
 
 monitor = PerformanceMonitor()
 
 # ==========================================
-# 📹 CORE PROCESSING LOOP (Generator)
+# 📹 CORE PROCESSING LOOP
 # ==========================================
 def process_frame(frame):
     global ZOOM_LEVEL, CURRENT_MODE
     loop_start = time.time()
     monitor.update_system_stats()
     
-    # Select System
     system = loaded_systems.get(CURRENT_MODE)
     if not system:
-        cv2.putText(frame, "Model Loading / Error", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        cv2.putText(frame, "Model Loading Error", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
         return frame
 
     # Digital Zoom
@@ -191,9 +207,7 @@ def process_frame(frame):
     pill_crop_raw = None
     crop_coords = None
 
-    # ---------------------------
-    # 1. DETECT (YOLO)
-    # ---------------------------
+    # 1. DETECT
     t0 = time.time()
     results = system['det_model'](frame, verbose=False, imgsz=640, conf=0.5)
     monitor.seg_time = time.time() - t0
@@ -215,16 +229,14 @@ def process_frame(frame):
         pill_crop_raw = frame[y1:y2, x1:x2]
         crop_coords = (x1, y1, x2-x1, y2-y1)
 
-    # ---------------------------
-    # 2. CLASSIFY (.pth)
-    # ---------------------------
+    # 2. CLASSIFY
     final_input_img = None 
     class_name = "Scanning..."
     conf_val = 0.0
     color = (100, 100, 100)
 
     if pill_crop_raw is not None and pill_crop_raw.size > 0:
-        final_input_img = remove_green_bg_auto(pill_crop_raw) # 🟢 Auto Green Screen
+        final_input_img = remove_green_bg_auto(pill_crop_raw)
 
         t1 = time.time()
         img_rgb = cv2.cvtColor(final_input_img, cv2.COLOR_BGR2RGB)
@@ -243,7 +255,11 @@ def process_frame(frame):
         idx_val = predicted_idx.item()
         
         if conf_val > CONFIDENCE_THRESHOLD:
-            class_name = system['class_names'][idx_val]
+            # Safety check for index out of range
+            if idx_val < len(system['class_names']):
+                class_name = system['class_names'][idx_val]
+            else:
+                class_name = f"Class_{idx_val}"
             color = (0, 255, 0)
         else:
             class_name = "Unknown"
@@ -252,9 +268,7 @@ def process_frame(frame):
         cx, cy, cw, ch = crop_coords
         cv2.rectangle(display_frame, (cx, cy), (cx+cw, cy+ch), color, 3)
 
-    # ---------------------------
-    # 3. UI OVERLAY (Fix Broadcast)
-    # ---------------------------
+    # 3. UI
     if final_input_img is not None:
         try:
             preview_size = 150
@@ -269,11 +283,10 @@ def process_frame(frame):
 
     monitor.total_time = time.time() - loop_start
     
-    # Status Bar
+    # HUD
     cv2.rectangle(display_frame, (0, 0), (w_main, 40), (0,0,0), -1)
     cv2.putText(display_frame, f"MODE: {CURRENT_MODE} (Press 'P')", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
     
-    # Info Box
     overlay = display_frame.copy()
     cv2.rectangle(overlay, (0, 50), (350, 200), (0, 0, 0), -1)
     display_frame = cv2.addWeighted(overlay, 0.6, display_frame, 0.4, 0)
@@ -291,24 +304,20 @@ def generate_frames():
     cap = cv2.VideoCapture(CAMERA_INDEX)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    
     if not cap.isOpened():
         print("❌ Camera Error")
         return
-
     while True:
         success, frame = cap.read()
         if not success: break
-        
         with lock:
             processed = process_frame(frame)
-        
         ret, buffer = cv2.imencode('.jpg', processed)
         frame_bytes = buffer.tobytes()
         yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
 
 # ==========================================
-# 🌐 WEB SERVER (Interface)
+# 🌐 WEB SERVER
 # ==========================================
 HTML = """
 <!DOCTYPE html>
@@ -333,7 +342,6 @@ HTML = """
             });
         }
         function toggle() { fetch('/toggle_mode').then(updateMode); }
-        
         document.addEventListener('keydown', e => {
             if(e.key.toLowerCase() === 'p') toggle();
         });
