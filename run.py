@@ -30,8 +30,9 @@ MODELS = {
     }
 }
 
-# 🔧 CROP SETTING: ขยายขนาด Crop ให้กว้างขึ้นเพื่อแก้ปัญหา Crop ไม่เต็มกล่อง
-CROP_EXPANSION_RATIO = 2.0  # ขยายพื้นที่ Crop เป็น 2 เท่าของกรอบที่ Detect เจอ
+# 🔧 PADDING SETTING: เผื่อขอบกี่ % (0.15 = 15%)
+# เพื่อให้เห็น "ทั้งกล่อง" ไม่ให้มุมแหว่ง
+PADDING_RATIO = 0.15 
 
 CONFIDENCE_THRESHOLD = 0.65
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -47,7 +48,6 @@ lock = threading.Lock()
 # 🚀 MULTI-THREADING CAMERA CLASS
 # ==========================================
 class WebcamStream:
-    """ อ่านภาพจากกล้องใน Thread แยก เพื่อให้ Video ไม่กระตุก """
     def __init__(self, src=0):
         self.stream = cv2.VideoCapture(src)
         self.stream.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
@@ -56,14 +56,12 @@ class WebcamStream:
         self.stopped = False
 
     def start(self):
-        # เริ่ม Thread อ่านภาพ
         threading.Thread(target=self.update, args=()).start()
         return self
 
     def update(self):
         while True:
-            if self.stopped:
-                return
+            if self.stopped: return
             (self.grabbed, self.frame) = self.stream.read()
 
     def read(self):
@@ -134,7 +132,7 @@ def remove_green_bg_auto(image):
     return result
 
 # ==========================================
-# 🚀 SYSTEM INIT & MODEL LOADING
+# 🚀 SYSTEM INIT
 # ==========================================
 app = Flask(__name__)
 loaded_systems = {}
@@ -143,17 +141,10 @@ def load_system(mode_name, config):
     print(f"⏳ Loading {mode_name} System...")
     sys_data = {}
     
-    # 1. Load Detector (.onnx)
-    if not os.path.exists(config['det']):
-        print(f"❌ {mode_name} DET not found: {config['det']}")
-        return None
+    if not os.path.exists(config['det']): return None
     sys_data['det_model'] = YOLO(config['det'], task='detect')
 
-    # 2. Load CLS Model (.pth)
-    if not os.path.exists(config['cls']):
-        print(f"❌ {mode_name} CLS not found: {config['cls']}")
-        return None
-        
+    if not os.path.exists(config['cls']): return None
     checkpoint = torch.load(config['cls'], map_location=DEVICE)
     class_names = checkpoint.get('class_names', ["Unknown"] * 100)
     img_size = checkpoint.get('img_size', config['img_size'])
@@ -192,15 +183,13 @@ except Exception as e:
     print(f"CRITICAL ERROR LOADING MODELS: {e}")
 
 # ==========================================
-# 📹 CORE PROCESSING LOOP
+# 📹 CORE PROCESSING LOOP (CORRECTED CROP)
 # ==========================================
 def process_frame(frame):
     global ZOOM_LEVEL, CURRENT_MODE
     
     system = loaded_systems.get(CURRENT_MODE)
-    if not system:
-        cv2.putText(frame, "Model Loading Error", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-        return frame
+    if not system: return frame
 
     # Digital Zoom
     if ZOOM_LEVEL > 1.0:
@@ -222,23 +211,27 @@ def process_frame(frame):
     if results and len(results[0].boxes) > 0:
         boxes = results[0].boxes
         max_idx = torch.argmax(boxes.conf).item()
+        
+        # ✅ เอา Coordinates 4 มุมจาก YOLO โดยตรง
         x1_raw, y1_raw, x2_raw, y2_raw = boxes.xyxy[max_idx].cpu().numpy()
         
-        # --- 🔧 NEW CROP LOGIC (Expanded) ---
-        w_box, h_box = x2_raw - x1_raw, y2_raw - y1_raw
-        cx, cy = x1_raw + w_box/2, y1_raw + h_box/2
+        # คำนวณความกว้าง/สูงจริงของกล่อง
+        box_w = x2_raw - x1_raw
+        box_h = y2_raw - y1_raw
         
-        # ขยายพื้นที่ Crop ตาม Ratio (เช่น 2.0 คือใหญ่ขึ้น 2 เท่า)
-        # สิ่งนี้จะช่วยแก้ปัญหา YOLO เจอแค่ส่วนเดียวของกล่อง
-        side = max(w_box, h_box) * CROP_EXPANSION_RATIO
+        # ✅ PADDING LOGIC: เผื่อขอบออกไปด้านละนิด (ตาม PADDING_RATIO)
+        pad_w = int(box_w * PADDING_RATIO)
+        pad_h = int(box_h * PADDING_RATIO)
         
-        x1 = int(max(0, cx - side//2))
-        y1 = int(max(0, cy - side//2))
-        x2 = int(min(w_main, cx + side//2))
-        y2 = int(min(h_main, cy + side//2))
+        # คำนวณจุดตัดใหม่ (พร้อมเช็คไม่ให้ทะลุขอบภาพ)
+        x1_crop = int(max(0, x1_raw - pad_w))
+        y1_crop = int(max(0, y1_raw - pad_h))
+        x2_crop = int(min(w_main, x2_raw + pad_w))
+        y2_crop = int(min(h_main, y2_raw + pad_h))
         
-        pill_crop_raw = frame[y1:y2, x1:x2]
-        crop_coords = (x1, y1, x2-x1, y2-y1)
+        # Crop ตามนี้เป๊ะๆ (ได้กล่องครบ + พื้นหลังนิดหน่อย)
+        pill_crop_raw = frame[y1_crop:y2_crop, x1_crop:x2_crop]
+        crop_coords = (x1_crop, y1_crop, x2_crop-x1_crop, y2_crop-y1_crop)
 
     # 2. CLASSIFY
     final_input_img = None 
@@ -252,6 +245,7 @@ def process_frame(frame):
         img_rgb = cv2.cvtColor(final_input_img, cv2.COLOR_BGR2RGB)
         img_pil = Image.fromarray(img_rgb)
         
+        # Resize จะเกิดตรงนี้ (Transform)
         input_tensor = system['transform'](img_pil).unsqueeze(0).to(DEVICE)
         
         with torch.no_grad():
@@ -273,11 +267,11 @@ def process_frame(frame):
             class_name = "Unknown"
             color = (0, 0, 255)
 
-        # วาดกรอบ Crop ที่ขยายแล้ว (สีเขียว)
+        # Draw box (สีเขียว)
         cx, cy, cw, ch = crop_coords
         cv2.rectangle(display_frame, (cx, cy), (cx+cw, cy+ch), color, 3)
 
-    # 3. UI Overlay (Clean Version - No Debug Text)
+    # 3. UI Overlay
     if final_input_img is not None:
         try:
             preview_size = 150
@@ -290,39 +284,30 @@ def process_frame(frame):
                 display_frame[y_pos:y_pos+h_crop, x_pos:x_pos+w_crop] = display_crop
         except: pass
 
-    # Status Bar (Clean)
+    # Status Bar
     cv2.rectangle(display_frame, (0, 0), (w_main, 40), (0,0,0), -1)
     cv2.putText(display_frame, f"MODE: {CURRENT_MODE} (Press 'P')", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
     
-    # Info Box (Result Only)
+    # Info Box
     overlay = display_frame.copy()
-    cv2.rectangle(overlay, (0, 50), (350, 150), (0, 0, 0), -1) # ลดขนาดกล่องดำลงเพราะเอา Text ออก
+    cv2.rectangle(overlay, (0, 50), (350, 150), (0, 0, 0), -1) 
     display_frame = cv2.addWeighted(overlay, 0.6, display_frame, 0.4, 0)
     
     cv2.putText(display_frame, f"CLASS: {class_name}", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
     cv2.putText(display_frame, f"CONF:  {conf_val*100:.1f}%", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
-    
-    # ❌ REMOVED: Debug Performance Text (CPU, RAM, Time)
 
     return display_frame
 
 def generate_frames():
-    # ใช้ WebcamStream แบบ Multithread แทน cv2.VideoCapture ตรงๆ
     vs = WebcamStream(src=CAMERA_INDEX).start()
-    time.sleep(2.0) # Warm up camera
-
+    time.sleep(2.0)
     while True:
         frame = vs.read()
-        if frame is None:
-            continue
-            
-        with lock:
-            processed = process_frame(frame)
-        
+        if frame is None: continue
+        with lock: processed = process_frame(frame)
         ret, buffer = cv2.imencode('.jpg', processed)
         frame_bytes = buffer.tobytes()
         yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-    
     vs.stop()
 
 # ==========================================
