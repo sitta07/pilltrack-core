@@ -209,7 +209,7 @@ def process_frame(frame):
 
     # 1. DETECT
     t0 = time.time()
-    results = system['det_model'](frame, verbose=False, imgsz=640, conf=0.7)
+    results = system['det_model'](frame, verbose=False, imgsz=640, conf=0.6)
     monitor.seg_time = time.time() - t0
 
     if results and len(results[0].boxes) > 0:
