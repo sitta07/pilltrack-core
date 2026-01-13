@@ -1,75 +1,65 @@
-import cv2
 import torch
 import torch.nn as nn
-import numpy as np
-import onnxruntime as ort
+import torch.nn.functional as F
 import timm
+import cv2
+import numpy as np
 from PIL import Image
 from torchvision import transforms
 import time
+import os
+import psutil
+from ultralytics import YOLO
 from flask import Flask, Response, render_template_string, jsonify
 import threading
-import os
 import logging
-
-# ==========================================
-# 🔧 DEBUG & LOGGING CONFIG
-# ==========================================
-# ตั้งค่า Log ให้โชว์เวลาและระดับความรุนแรง
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),  # โชว์ใน Terminal
-        logging.FileHandler("system_debug.log")  # บันทึกลงไฟล์เผื่อกลับมาดู
-    ]
-)
-logger = logging.getLogger(__name__)
 
 # ==========================================
 # ⚙️ CONFIGURATION & PATHS
 # ==========================================
-MODELS_DIR = "models"
-CAMERA_INDEX = 0
-
-# Thresholds (ปรับตรงนี้ถ้า detect ยาก/ง่ายไป)
-CONF_THRESHOLD = 0.4  # ความมั่นใจขั้นต่ำ (0.0 - 1.0)
-IOU_THRESHOLD = 0.5   # การซ้อนทับของกล่อง
-
-PATHS = {
+# อ้างอิง Path จาก Screenshot (โฟลเดอร์ models อยู่ระดับเดียวกับ run.py)
+MODELS = {
     'BOX': {
-        'det': os.path.join(MODELS_DIR, "box_detector.onnx"),
-        'cls': os.path.join(MODELS_DIR, "box_model_production.pth"),
-        'size': 640
+        'cls': 'models/box_model_production.pth',
+        'det': 'models/box_detector.onnx',
+        'img_size': 640
     },
     'PILL': {
-        'det': os.path.join(MODELS_DIR, "pill_detector.onnx"),
-        'cls': os.path.join(MODELS_DIR, "pill_model_production.pth"),
-        'size': 384
+        'cls': 'models/pill_model_production.pth',
+        'det': 'models/pill_detector.onnx',
+        'img_size': 384
     }
 }
 
+CONFIDENCE_THRESHOLD = 0.65
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+CAMERA_INDEX = 0  # 📷 ใช้กล้อง 0 ตามสั่ง
+
+# Global State
 CURRENT_MODE = 'BOX'
+ZOOM_LEVEL = 1.0
+ZOOM_STEP = 0.1
 lock = threading.Lock()
 
 # ==========================================
-# 🧠 MODEL DEFINITIONS (Base Code)
+# 🏗️ MODEL DEFINITION (Strictly Original)
 # ==========================================
 class ArcMarginProduct(nn.Module):
     def __init__(self, in_features, out_features, s=30.0, m=0.50):
         super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
         self.weight = nn.Parameter(torch.FloatTensor(out_features, in_features))
-    def forward(self, input):
-        return input
+        self.s = s
+        nn.init.xavier_uniform_(self.weight)
+    def forward(self, input, label=None):
+        return F.linear(F.normalize(input), F.normalize(self.weight)) * self.s
 
 class PillModelGodTier(nn.Module):
-    def __init__(self, num_classes=11, model_name="convnext_tiny"):
+    def __init__(self, num_classes, model_name="convnext_tiny", img_size=640):
         super().__init__()
         self.backbone = timm.create_model(model_name, pretrained=False, num_classes=0)
-        dummy = torch.randn(1, 3, 224, 224)
-        in_features = self.backbone(dummy).shape[1]
+        with torch.no_grad():
+            dummy = torch.randn(1, 3, img_size, img_size)
+            in_features = self.backbone(dummy).shape[1]
         self.bn_in = nn.BatchNorm1d(in_features)
         self.dropout = nn.Dropout(p=0.3)
         self.fc_emb = nn.Linear(in_features, 512)
@@ -83,248 +73,278 @@ class PillModelGodTier(nn.Module):
         return emb
 
 # ==========================================
-# 🛠️ SYSTEM INITIALIZATION
+# 🛠️ HELPER FUNCTIONS (Original Logic)
+# ==========================================
+def get_auto_hsv_bounds(frame, sample_size=30):
+    h, w, _ = frame.shape
+    tl = frame[0:sample_size, 0:sample_size]
+    tr = frame[0:sample_size, w-sample_size:w]
+    bl = frame[h-sample_size:h, 0:sample_size]
+    br = frame[h-sample_size:h, w-sample_size:w]
+    samples = np.vstack((tl, tr, bl, br))
+    hsv_samples = cv2.cvtColor(samples, cv2.COLOR_BGR2HSV)
+    mean = np.mean(hsv_samples, axis=(0, 1))
+    
+    lower_bound = mean - np.array([20, 50, 50])
+    upper_bound = mean + np.array([20, 50, 50])
+    
+    lower_green = np.clip(lower_bound, np.array([0, 0, 0]), np.array([180, 255, 255])).astype(np.uint8)
+    upper_green = np.clip(upper_bound, np.array([0, 0, 0]), np.array([180, 255, 255])).astype(np.uint8)
+    return lower_green, upper_green
+
+def remove_green_bg_auto(image):
+    if image is None or image.size == 0: return image
+    lower, upper = get_auto_hsv_bounds(image)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, lower, upper)
+    mask_inv = cv2.bitwise_not(mask)
+    result = cv2.bitwise_and(image, image, mask=mask_inv)
+    return result
+
+class PerformanceMonitor:
+    def __init__(self):
+        self.seg_time = 0; self.cls_time = 0; self.total_time = 0
+        self.cpu_usage = 0; self.ram_usage = 0; self.last_update = time.time()
+    def update_system_stats(self):
+        if time.time() - self.last_update > 1.0:
+            self.cpu_usage = psutil.cpu_percent()
+            self.ram_usage = psutil.virtual_memory().percent
+            self.last_update = time.time()
+    def get_overlay_text(self):
+        return [f"CPU: {self.cpu_usage}% | RAM: {self.ram_usage}%",
+                f"DET: {self.seg_time*1000:.1f}ms | CLS: {self.cls_time*1000:.1f}ms"]
+
+# ==========================================
+# 🚀 SYSTEM INIT & MODEL LOADING
 # ==========================================
 app = Flask(__name__)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-logger.info(f"🚀 System Starting on Device: {device}")
+loaded_systems = {} # เก็บโมเดลทั้ง Box และ Pill ไว้ในนี้
 
-# --- Load Detectors ---
-logger.info("👁️ Loading ONNX Detectors...")
-detectors = {}
-try:
-    # Check files exist
-    if not os.path.exists(PATHS['BOX']['det']):
-        logger.error(f"❌ File not found: {PATHS['BOX']['det']}")
+def load_system(mode_name, config):
+    print(f"⏳ Loading {mode_name} System...")
+    sys_data = {}
     
-    # Load Models
-    detectors['BOX'] = ort.InferenceSession(PATHS['BOX']['det'], providers=['CPUExecutionProvider'])
-    detectors['PILL'] = ort.InferenceSession(PATHS['PILL']['det'], providers=['CPUExecutionProvider'])
-    logger.info("✅ Detectors Loaded Successfully")
-except Exception as e:
-    logger.critical(f"❌ Error loading ONNX: {e}")
-
-# --- Load Classifiers ---
-logger.info("🧠 Loading Classifiers...")
-classifiers = {}
-transforms_dict = {}
-
-def load_cls_model(path, size, num_classes=11):
-    try:
-        if not os.path.exists(path):
-            logger.warning(f"⚠️ Model file missing: {path}")
-            return None, None
-            
-        model = PillModelGodTier(num_classes=num_classes)
-        checkpoint = torch.load(path, map_location=device)
-        model.load_state_dict(checkpoint, strict=False)
-        model.to(device)
-        model.eval()
+    # 1. Load CLS Model (.pth) - ใช้ Logic เดิมเป๊ะๆ
+    if not os.path.exists(config['cls']):
+        print(f"❌ {mode_name} CLS not found: {config['cls']}")
+        return None
         
-        preprocess = transforms.Compose([
-            transforms.Resize((size, size)),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-        ])
-        return model, preprocess
-    except Exception as e:
-        logger.error(f"❌ Error loading Classifier {path}: {e}")
-        return None, None
-
-classifiers['BOX'], transforms_dict['BOX'] = load_cls_model(PATHS['BOX']['cls'], PATHS['BOX']['size'])
-classifiers['PILL'], transforms_dict['PILL'] = load_cls_model(PATHS['PILL']['cls'], PATHS['PILL']['size'])
-
-# ==========================================
-# 🕵️ YOLO UTILS (The Missing Piece)
-# ==========================================
-def parse_yolo_output(outputs, img_w, img_h):
-    # YOLOv8 Output shape: (1, 4 + num_classes, 8400) -> e.g. (1, 5, 8400)
-    # 4 coords (cx, cy, w, h) + probability
+    checkpoint = torch.load(config['cls'], map_location=DEVICE)
+    class_names = checkpoint.get('class_names', ["Unknown"] * 100)
+    # ถ้าไม่มี img_size ใน checkpoint ให้ใช้จาก config
+    img_size = checkpoint.get('img_size', config['img_size']) 
     
-    output = outputs[0]  # (1, 84, 8400)
-    output = output.transpose() # (8400, 84)
-
-    boxes = []
-    confidences = []
-    class_ids = []
-
-    # Loop through all 8400 rows
-    for row in output:
-        # Get max confidence score
-        classes_scores = row[4:]
-        if len(classes_scores) == 0: continue # Safety
-        
-        _, max_score, _, max_class_loc = cv2.minMaxLoc(classes_scores)
-        
-        if max_score > CONF_THRESHOLD:
-            # Extract Box
-            cx, cy, w, h = row[0], row[1], row[2], row[3]
-            
-            # Convert to Top-Left corner
-            x1 = int((cx - w/2) * img_w / 640) # Scale back to original image
-            y1 = int((cy - h/2) * img_h / 640)
-            w_px = int(w * img_w / 640)
-            h_px = int(h * img_h / 640)
-            
-            boxes.append([x1, y1, w_px, h_px])
-            confidences.append(float(max_score))
-            class_ids.append(max_class_loc[1])
-
-    # NMS (Non-Maximum Suppression) to remove duplicate boxes
-    indices = cv2.dnn.NMSBoxes(boxes, confidences, CONF_THRESHOLD, IOU_THRESHOLD)
+    state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
     
-    results = []
-    if len(indices) > 0:
-        for i in indices.flatten():
-            results.append((boxes[i], confidences[i], class_ids[i]))
-            
-    return results
+    model = PillModelGodTier(num_classes=len(class_names), img_size=img_size).to(DEVICE)
+    model.load_state_dict(state_dict, strict=False)
+    model.eval()
+    
+    sys_data['cls_model'] = model
+    sys_data['class_names'] = class_names
+    sys_data['transform'] = transforms.Compose([
+        transforms.Resize((img_size, img_size)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    
+    # 2. Load Detector (.onnx) via Ultralytics
+    if not os.path.exists(config['det']):
+        print(f"❌ {mode_name} DET not found: {config['det']}")
+        return None
+    sys_data['det_model'] = YOLO(config['det'], task='detect') # บังคับ detect ให้ชัวร์
+    
+    print(f"✅ {mode_name} Loaded.")
+    return sys_data
+
+# Load Everything at Startup
+loaded_systems['BOX'] = load_system('BOX', MODELS['BOX'])
+loaded_systems['PILL'] = load_system('PILL', MODELS['PILL'])
+
+monitor = PerformanceMonitor()
 
 # ==========================================
-# 📹 CORE PROCESSING LOOP
+# 📹 CORE PROCESSING LOOP (Generator)
 # ==========================================
-def process_frame(frame, mode):
-    start_time = time.time()
-    img_h, img_w = frame.shape[:2]
+def process_frame(frame):
+    global ZOOM_LEVEL, CURRENT_MODE
+    loop_start = time.time()
+    monitor.update_system_stats()
     
-    # 1. Select Engine
-    session = detectors.get(mode)
-    if session is None:
-        cv2.putText(frame, "Model Error", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+    # Select System
+    system = loaded_systems.get(CURRENT_MODE)
+    if not system:
+        cv2.putText(frame, "Model Loading / Error", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
         return frame
 
-    # 2. Preprocess for YOLO
-    # YOLOv8 expects RGB, Normalized 0-1, (1, 3, 640, 640)
-    blob = cv2.dnn.blobFromImage(frame, 1/255.0, (640, 640), swapRB=True, crop=False)
+    # Digital Zoom
+    if ZOOM_LEVEL > 1.0:
+        h, w, _ = frame.shape
+        new_w, new_h = int(w/ZOOM_LEVEL), int(h/ZOOM_LEVEL)
+        x1 = (w - new_w) // 2
+        y1 = (h - new_h) // 2
+        frame = cv2.resize(frame[y1:y1+new_h, x1:x1+new_w], (w, h))
+
+    display_frame = frame.copy()
+    h_main, w_main, _ = display_frame.shape
     
-    # 3. Inference
-    input_name = session.get_inputs()[0].name
-    try:
-        outputs = session.run(None, {input_name: blob})
+    pill_crop_raw = None
+    crop_coords = None
+
+    # ---------------------------
+    # 1. DETECT (YOLO)
+    # ---------------------------
+    t0 = time.time()
+    results = system['det_model'](frame, verbose=False, imgsz=640, conf=0.5)
+    monitor.seg_time = time.time() - t0
+
+    if results and len(results[0].boxes) > 0:
+        boxes = results[0].boxes
+        max_idx = torch.argmax(boxes.conf).item()
+        x1_raw, y1_raw, x2_raw, y2_raw = boxes.xyxy[max_idx].cpu().numpy()
         
-        # 4. Post-process (Parse Output)
-        detections = parse_yolo_output(outputs, img_w, img_h)
+        w_box, h_box = x2_raw - x1_raw, y2_raw - y1_raw
+        cx, cy = x1_raw + w_box/2, y1_raw + h_box/2
+        side = max(w_box, h_box) + 40
         
-        # Log detections count
-        if len(detections) > 0:
-            logger.debug(f"📸 Mode {mode}: Found {len(detections)} objects")
+        x1 = int(max(0, cx - side//2))
+        y1 = int(max(0, cy - side//2))
+        x2 = int(min(w_main, cx + side//2))
+        y2 = int(min(h_main, cy + side//2))
+        
+        pill_crop_raw = frame[y1:y2, x1:x2]
+        crop_coords = (x1, y1, x2-x1, y2-y1)
 
-        # 5. Draw & Classify
-        for (box, score, cls_id) in detections:
-            x, y, w, h = box
-            
-            # --- Draw Box ---
-            color = (0, 255, 0) if mode == 'PILL' else (255, 165, 0)
-            cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
-            
-            # --- Prepare text ---
-            label = f"Conf: {score:.2f}"
-            
-            # Optional: Add Classification Logic Here
-            # crop = frame[y:y+h, x:x+w]
-            # ... pass crop to classifiers[mode] ...
-            
-            cv2.putText(frame, label, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    # ---------------------------
+    # 2. CLASSIFY (.pth)
+    # ---------------------------
+    final_input_img = None 
+    class_name = "Scanning..."
+    conf_val = 0.0
+    color = (100, 100, 100)
 
-    except Exception as e:
-        logger.error(f"Inference Error: {e}")
+    if pill_crop_raw is not None and pill_crop_raw.size > 0:
+        final_input_img = remove_green_bg_auto(pill_crop_raw) # 🟢 Auto Green Screen
 
-    # 6. FPS & Status
-    fps = 1.0 / (time.time() - start_time)
-    cv2.putText(frame, f"MODE: {mode} | FPS: {fps:.1f}", (10, 30), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        t1 = time.time()
+        img_rgb = cv2.cvtColor(final_input_img, cv2.COLOR_BGR2RGB)
+        img_pil = Image.fromarray(img_rgb)
+        
+        input_tensor = system['transform'](img_pil).unsqueeze(0).to(DEVICE)
+        
+        with torch.no_grad():
+            emb = system['cls_model'](input_tensor)
+            logits = F.linear(F.normalize(emb), F.normalize(system['cls_model'].head.weight))
+            probs = F.softmax(logits * 30.0, dim=1)
+            confidence, predicted_idx = torch.max(probs, 1)
+        monitor.cls_time = time.time() - t1
+        
+        conf_val = confidence.item()
+        idx_val = predicted_idx.item()
+        
+        if conf_val > CONFIDENCE_THRESHOLD:
+            class_name = system['class_names'][idx_val]
+            color = (0, 255, 0)
+        else:
+            class_name = "Unknown"
+            color = (0, 0, 255)
 
-    return frame
+        cx, cy, cw, ch = crop_coords
+        cv2.rectangle(display_frame, (cx, cy), (cx+cw, cy+ch), color, 3)
+
+    # ---------------------------
+    # 3. UI OVERLAY (Fix Broadcast)
+    # ---------------------------
+    if final_input_img is not None:
+        try:
+            preview_size = 150
+            display_crop = cv2.resize(final_input_img, (preview_size, preview_size))
+            display_crop = cv2.copyMakeBorder(display_crop, 2, 2, 2, 2, cv2.BORDER_CONSTANT, value=color)
+            h_crop, w_crop, _ = display_crop.shape
+            x_pos = w_main - w_crop - 20
+            y_pos = 100
+            if y_pos + h_crop < h_main and x_pos + w_crop < w_main:
+                display_frame[y_pos:y_pos+h_crop, x_pos:x_pos+w_crop] = display_crop
+        except: pass
+
+    monitor.total_time = time.time() - loop_start
+    
+    # Status Bar
+    cv2.rectangle(display_frame, (0, 0), (w_main, 40), (0,0,0), -1)
+    cv2.putText(display_frame, f"MODE: {CURRENT_MODE} (Press 'P')", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+    
+    # Info Box
+    overlay = display_frame.copy()
+    cv2.rectangle(overlay, (0, 50), (350, 200), (0, 0, 0), -1)
+    display_frame = cv2.addWeighted(overlay, 0.6, display_frame, 0.4, 0)
+    
+    cv2.putText(display_frame, f"CLASS: {class_name}", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+    cv2.putText(display_frame, f"CONF:  {conf_val*100:.1f}%", (10, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+    
+    stats = monitor.get_overlay_text()
+    for i, line in enumerate(stats):
+        cv2.putText(display_frame, line, (10, 150 + (i*20)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+    return display_frame
 
 def generate_frames():
-    logger.info(f"📷 Opening Camera Index: {CAMERA_INDEX}")
     cap = cv2.VideoCapture(CAMERA_INDEX)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     
     if not cap.isOpened():
-        logger.critical("❌ Could not open webcam! Check USB connection.")
+        print("❌ Camera Error")
         return
 
-    # Optimization
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    
-    frame_count = 0
-    
     while True:
         success, frame = cap.read()
-        if not success:
-            logger.warning("⚠️ Failed to read frame from camera.")
-            time.sleep(1)
-            continue
-            
-        frame_count += 1
+        if not success: break
         
         with lock:
-            mode_now = CURRENT_MODE
-            
-        # Process every frame
-        processed_frame = process_frame(frame, mode_now)
+            processed = process_frame(frame)
         
-        # Log ping every 100 frames to ensure alive
-        if frame_count % 100 == 0:
-            logger.info("🟢 System Alive - Streaming...")
-
-        try:
-            ret, buffer = cv2.imencode('.jpg', processed_frame)
-            frame_bytes = buffer.tobytes()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-        except Exception as e:
-            logger.error(f"Encoding error: {e}")
+        ret, buffer = cv2.imencode('.jpg', processed)
+        frame_bytes = buffer.tobytes()
+        yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
 
 # ==========================================
 # 🌐 WEB SERVER (Interface)
 # ==========================================
-HTML_PAGE = """
+HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PillTrack Monitor</title>
-    <style>
-        body { background-color: #1a1a1a; color: white; font-family: sans-serif; text-align: center; }
-        .monitor { border: 2px solid #555; max-width: 90%; }
-        button { padding: 15px 30px; font-size: 18px; margin-top: 20px; 
-                 background: #007bff; color: white; border: none; cursor: pointer; border-radius: 5px;}
-        button:hover { background: #0056b3; }
-        .log-box { margin-top: 20px; font-family: monospace; color: #aaa; font-size: 12px; }
-    </style>
+<title>PillTrack System</title>
+<style>
+    body { background: #111; color: white; text-align: center; font-family: sans-serif; overflow: hidden; }
+    img { max-width: 100%; height: auto; border: 2px solid #333; }
+    .status { margin-top: 10px; font-size: 24px; font-weight: bold; }
+</style>
 </head>
 <body>
-    <h1>💊 PillTrack Debug Console</h1>
-    <img src="/video_feed" class="monitor">
-    <h2 id="mode-text">Current Mode: LOADING...</h2>
-    <button onclick="toggleMode()">Click or Press 'P' to Switch Mode</button>
-    <div class="log-box">Check terminal for detailed logs...</div>
-
+    <img src="/video_feed">
+    <div class="status">Current Mode: <span id="mode" style="color:yellow">LOADING</span></div>
     <script>
         function updateMode() {
-            fetch('/get_mode')
-                .then(r => r.json())
-                .then(d => {
-                    document.getElementById('mode-text').innerText = "Mode: " + d.mode;
-                    document.getElementById('mode-text').style.color = (d.mode === 'PILL') ? '#00ff00' : '#ffa500';
-                });
+            fetch('/get_mode').then(r=>r.json()).then(d=>{
+                const el = document.getElementById('mode');
+                el.innerText = d.mode;
+                el.style.color = d.mode === 'PILL' ? '#0f0' : '#fa0';
+            });
         }
-        function toggleMode() { fetch('/toggle_mode').then(() => updateMode()); }
+        function toggle() { fetch('/toggle_mode').then(updateMode); }
         
-        document.addEventListener('keydown', (e) => {
-            if (e.key === 'p' || e.key === 'P') toggleMode();
+        document.addEventListener('keydown', e => {
+            if(e.key.toLowerCase() === 'p') toggle();
         });
-        
         setInterval(updateMode, 1000);
-        updateMode();
     </script>
 </body>
 </html>
 """
 
 @app.route('/')
-def index(): return render_template_string(HTML_PAGE)
+def index(): return render_template_string(HTML)
 
 @app.route('/video_feed')
 def video_feed(): return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
@@ -334,12 +354,11 @@ def toggle_mode():
     global CURRENT_MODE
     with lock:
         CURRENT_MODE = 'PILL' if CURRENT_MODE == 'BOX' else 'BOX'
-    logger.info(f"🔄 Mode Switched to: {CURRENT_MODE}")
     return jsonify(success=True, mode=CURRENT_MODE)
 
 @app.route('/get_mode')
 def get_mode(): return jsonify(mode=CURRENT_MODE)
 
 if __name__ == '__main__':
-    logger.info("🌍 Server starting at http://0.0.0.0:5000")
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+    print("🌍 Server running: http://0.0.0.0:5000")
+    app.run(host='0.0.0.0', port=5000, threaded=True)
