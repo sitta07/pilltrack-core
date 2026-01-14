@@ -18,10 +18,10 @@ current_mode = 'BOX'
 zoom_level = 1.0
 lock = threading.Lock()
 
-# 🚀 PERFORMANCE TUNING VARS
-SKIP_FRAMES = 4          # รัน AI ทุกๆ 4 เฟรม (เพิ่มขึ้นเพื่อให้ลื่น)
-STREAM_WIDTH = 640       # ย่อภาพก่อนส่งขึ้นเว็บ (ลดภาระ CPU ในการ Encode)
-INFERENCE_WIDTH = 640    # ย่อภาพก่อนส่งเข้า AI (ถ้ากล้องละเอียดเกินไป)
+# 🚀 HIGH FIDELITY SETTINGS (ชัดเป๊ะ)
+SKIP_FRAMES = 3          # รัน AI ทุกๆ 3 เฟรม (ช่วย CPU นิดนึง)
+STREAM_WIDTH = 1280      # ⚡️ ปรับกลับมาเป็น HD (จอใหญ่สะใจ)
+JPEG_QUALITY = 90        # ⚡️ ภาพชัด 90% (ไม่แตกแล้ว)
 
 # State Variables
 qc_state = {'locked': False, 'winner_name': "...", 'vote_stats': "", 'avg_conf': 0.0}
@@ -34,21 +34,30 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PillTrack AI</title>
+    <title>PillTrack AI - HD</title>
     <style>
         body { background-color: #121212; color: white; font-family: 'Segoe UI', sans-serif; text-align: center; margin: 0; padding: 10px; }
-        .container { position: relative; display: inline-block; border: 2px solid #333; border-radius: 8px; overflow: hidden; }
-        img { display: block; width: 100%; max-width: 800px; height: auto; }
-        .btn { padding: 10px 20px; font-size: 16px; margin: 5px; cursor: pointer; background: #222; color: #aaa; border: 1px solid #444; border-radius: 6px; }
+        /* ปรับ CSS ให้รูปขยายเต็มจอที่สุดเท่าที่จะทำได้ */
+        .container { 
+            position: relative; 
+            display: inline-block; 
+            border: 2px solid #333; 
+            border-radius: 8px; 
+            overflow: hidden;
+            width: 95%; /* กว้างเกือบเต็มจอ */
+            max-width: 1280px; /* ไม่เกิน HD */
+        }
+        img { display: block; width: 100%; height: auto; }
+        .btn { padding: 15px 30px; font-size: 18px; margin: 5px; cursor: pointer; background: #222; color: #aaa; border: 1px solid #444; border-radius: 6px; }
         .btn.active { background: #00d4ff; color: #000; font-weight: bold; border-color: #00d4ff; }
-        .status-bar { margin-top: 10px; color: #ccc; }
+        .status-bar { margin-top: 10px; color: #ccc; font-size: 1.2em; }
     </style>
 </head>
 <body>
-    <h3>💊 PillTrack AI <span style="font-size:0.6em; color:#00ff00">v1.9 Turbo</span></h3>
+    <h2>💊 PillTrack AI <span style="font-size:0.6em; color:#00ff00">v2.0 HD</span></h2>
     <div class="container"><img src="/video_feed"></div>
     <div class="status-bar">MODE: <span id="mode-display" style="color:#ffeb3b">...</span></div>
-    <div style="margin-top:10px">
+    <div style="margin-top:15px">
         <button class="btn" id="btn-box" onclick="setMode('BOX')">📦 Box</button>
         <button class="btn" id="btn-pill" onclick="setMode('PILL')">💊 Pill</button>
         <button class="btn" id="btn-qc" onclick="setMode('QC')">🕵️ QC</button>
@@ -64,7 +73,7 @@ HTML_TEMPLATE = """
         function setMode(mode) { fetch('/set_mode/' + mode).then(r=>r.json()).then(d=>updateUI(d.mode)); }
         function syncState() { fetch('/get_mode').then(r=>r.json()).then(d=>updateUI(d.mode)); }
         document.addEventListener('keydown', e => {
-            if(e.key.toLowerCase() === 'p') setMode('QC'); // Quick key
+            if(e.key.toLowerCase() === 'p') setMode('QC');
         });
         setInterval(syncState, 1000);
     </script>
@@ -73,26 +82,25 @@ HTML_TEMPLATE = """
 """
 
 def draw_overlay(frame, mode, results):
-    # วาดบนภาพ Original Resolution ไปเลย แล้วค่อยย่อทีหลัง
-    display = frame # ไม่ copy เพื่อประหยัด RAM (วาดทับเลย)
+    display = frame # วาดลงภาพ Original เลย
     h, w = display.shape[:2]
     
     # Header
-    cv2.rectangle(display, (0, 0), (w, 50), (0, 0, 0), -1)
+    cv2.rectangle(display, (0, 0), (w, 60), (0, 0, 0), -1)
     color_map = {'BOX': (0, 255, 255), 'PILL': (0, 255, 0), 'QC': (255, 0, 255)}
-    cv2.putText(display, f"MODE: {mode}", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color_map.get(mode, (255,255,255)), 2)
+    cv2.putText(display, f"MODE: {mode}", (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color_map.get(mode, (255,255,255)), 3)
 
     if mode == 'BOX':
         for item in results.get('box_data', []):
             x1, y1, x2, y2 = item['coords']
-            cv2.rectangle(display, (x1, y1), (x2, y2), (255, 165, 0), 2)
-            cv2.putText(display, f"{item['name']}", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
+            cv2.rectangle(display, (x1, y1), (x2, y2), (255, 165, 0), 3)
+            cv2.putText(display, f"{item['name']}", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 165, 0), 2)
 
     elif mode == 'PILL':
         if results.get('coords'):
             x, y, w_rect, h_rect = results['coords']
-            cv2.rectangle(display, (x, y), (x+w_rect, y+h_rect), (0, 255, 0), 3)
-            cv2.putText(display, f"ID: {results['name']}", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2)
+            cv2.rectangle(display, (x, y), (x+w_rect, y+h_rect), (0, 255, 0), 4)
+            cv2.putText(display, f"ID: {results['name']}", (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
 
     elif mode == 'QC':
         qc_res = results.get('qc_data', {})
@@ -100,8 +108,8 @@ def draw_overlay(frame, mode, results):
             # 1. Draw Pack
             if qc_res.get('pack_coords'):
                 bx1, by1, bx2, by2 = qc_res['pack_coords']
-                cv2.rectangle(display, (bx1, by1), (bx2, by2), (0, 255, 255), 3)
-                cv2.putText(display, f"PACK: {qc_res.get('pack_name', 'Scanning...')}", (bx1, by1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                cv2.rectangle(display, (bx1, by1), (bx2, by2), (0, 255, 255), 4)
+                cv2.putText(display, f"PACK: {qc_res.get('pack_name', 'Scanning...')}", (bx1, by1-10), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
 
             # 2. Draw Pills
             for p_coord in qc_res.get('pills_coords', []):
@@ -109,15 +117,15 @@ def draw_overlay(frame, mode, results):
                 p_color = (0, 255, 0) if qc_state['locked'] else (200, 200, 200)
                 cv2.rectangle(display, (px1, py1), (px2, py2), p_color, 2)
 
-            # 3. Info Panel
-            cv2.rectangle(display, (0, 50), (600, 140), (0,0,0), -1)
+            # 3. Info Panel (ตัวหนังสือใหญ่ขึ้น)
+            cv2.rectangle(display, (0, 60), (800, 180), (0,0,0), -1)
             pill_name = qc_res.get('pill_name', 'Scanning...')
             count = qc_res.get('pill_count', 0)
             stats = qc_res.get('vote_stats', '')
             
-            cv2.putText(display, f"Result: {pill_name} (Qty: {count})", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+            cv2.putText(display, f"Result: {pill_name} (Qty: {count})", (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
             if stats:
-                cv2.putText(display, f"Votes: {stats}", (20, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                cv2.putText(display, f"Votes: {stats}", (20, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
 
     return display
 
@@ -131,13 +139,13 @@ def generate_frames():
             time.sleep(0.01)
             continue
             
-        # 1. Performance Zoom (Optional: Resize if input is huge)
-        # ถ้ากล้องมา 4K ต้องย่อก่อนเลย ไม่งั้นตาย
+        # ถ้ากล้องมาใหญ่มากๆ (เกิน HD) ให้ย่อเหลือ HD เพื่อไม่ให้ Server แตก
+        # แต่ถ้ากล้องเป็น HD อยู่แล้ว ก็ใช้เต็มๆ เลย
         h, w = frame.shape[:2]
-        if w > 1280: 
+        if w > 1920: 
             frame = cv2.resize(frame, (1280, 720))
 
-        # Digital Zoom (Logic เดิม)
+        # Digital Zoom
         if zoom_level > 1.0:
             h, w = frame.shape[:2]
             new_w, new_h = int(w/zoom_level), int(h/zoom_level)
@@ -149,8 +157,7 @@ def generate_frames():
 
         if mode != 'QC': qc_state['locked'] = False
 
-        # 🚀 SMART SKIPPING
-        # รัน AI ทุกๆ SKIP_FRAMES รอบ หรือถ้าเปลี่ยนโหมด หรือยังไม่มีค่าเก่า
+        # SKIP FRAMES Logic
         should_run_ai = (frame_count % SKIP_FRAMES == 0) or (not qc_last_results)
         
         if should_run_ai:
@@ -159,12 +166,10 @@ def generate_frames():
                 box_res = []
                 for box in boxes:
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    # Padding Logic
                     pad=10; h_img, w_img = frame.shape[:2]
                     bx1, by1 = max(0, x1-pad), max(0, y1-pad)
                     bx2, by2 = min(w_img, x2+pad), min(h_img, y2+pad)
                     crop = frame[by1:by2, bx1:bx2]
-                    
                     name, conf, _ = ai_engine.identify_object(crop, mode='BOX', preprocess='green_screen')
                     box_res.append({'coords':(x1,y1,x2,y2), 'name':name, 'conf':conf})
                 results['box_data'] = box_res
@@ -179,9 +184,6 @@ def generate_frames():
                     crop = frame[py1:py2, px1:px2]
                     name, conf, _ = ai_engine.identify_object(crop, mode='PILL', preprocess='green_screen')
                     results.update({'coords':(x1,y1,x2-x1,y2-y1), 'name':name, 'conf':conf})
-                else:
-                    # Fallback Center Scan (Optional: Disable to save CPU)
-                    pass
 
             elif mode == 'QC':
                 pack_boxes = ai_engine.predict_box_locations(frame)
@@ -195,17 +197,17 @@ def generate_frames():
                     bx1, by1, bx2, by2 = map(int, p_box.xyxy[0])
                     pack_crop = frame[by1:by2, bx1:bx2]
                     
-                    # 1. Identify Pack Name
+                    # 1. Pack Name
                     pack_name, _, _ = ai_engine.identify_object(pack_crop, mode='BOX', preprocess='green_screen')
                     
-                    # 2. Detect Pills (YOLO)
+                    # 2. Pills
                     pill_boxes = ai_engine.predict_pill_locations(pack_crop)
                     pills_coords = []
                     for pb in pill_boxes:
                         px1, py1, px2, py2 = map(int, pb.xyxy[0])
                         pills_coords.append((bx1+px1, by1+py1, bx1+px2, by1+py2))
                     
-                    # 3. Voting (Run Once)
+                    # 3. Vote
                     if not qc_state['locked'] and len(pill_boxes) > 0:
                         votes = []
                         for pb in pill_boxes:
@@ -235,25 +237,27 @@ def generate_frames():
         else:
             results = qc_last_results
 
-        # Draw Overlay (On Full Res)
+        # Draw Overlay
         final_frame = draw_overlay(frame, mode, results)
         frame_count += 1
         
-        # 🚀 FINAL OPTIMIZATION: Resize before encoding to JPEG 🚀
-        # ย่อรูปลงเหลือความกว้าง 640 ก่อนส่งให้ Browser
-        # สิ่งนี้ช่วยลดภาระการ Encode JPEG ได้มหาศาล!
+        # 🚀 FINAL OUTPUT: High Resolution & High Quality 🚀
+        # ถ้าภาพต้นฉบับใหญ่ (เช่น 1280px) ก็ส่งไปเต็มๆ เลย หรือย่อเล็กน้อยเพื่อให้เน็ตวิ่งไหว
+        # ปรับ STREAM_WIDTH ด้านบนได้ถ้าอยากได้ใหญ่กว่านี้
         h, w = final_frame.shape[:2]
-        aspect_ratio = h / w
-        target_w = STREAM_WIDTH
-        target_h = int(target_w * aspect_ratio)
+        if w > STREAM_WIDTH:
+            aspect_ratio = h / w
+            target_h = int(STREAM_WIDTH * aspect_ratio)
+            stream_frame = cv2.resize(final_frame, (STREAM_WIDTH, target_h))
+        else:
+            stream_frame = final_frame
         
-        stream_frame = cv2.resize(final_frame, (target_w, target_h))
-        
-        ret, buffer = cv2.imencode('.jpg', stream_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60]) # ลด Quality เหลือ 60%
+        # JPEG Quality 90 (ชัดกริ๊บ)
+        ret, buffer = cv2.imencode('.jpg', stream_frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
         if not ret: continue
         yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
 
-# Routes (เหมือนเดิม)
+# ... (Routes เหมือนเดิม) ...
 @app.route('/')
 def index(): return render_template_string(HTML_TEMPLATE)
 @app.route('/video_feed')
@@ -268,5 +272,5 @@ def get_mode_route(): return jsonify(mode=current_mode)
 def start_server(_camera, _engine, _config):
     global camera, ai_engine, config
     camera = _camera; ai_engine = _engine; config = _config
-    print(f"🌍 Web Interface running (Turbo Mode) at http://0.0.0.0:5000")
+    print(f"🌍 Web Interface running (HD Mode) at http://0.0.0.0:5000")
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
