@@ -8,11 +8,10 @@ from PIL import Image
 from torchvision import transforms
 from ultralytics import YOLO
 import os
-# 🔥 Import function ใหม่มาด้วย
-from src.utils import remove_green_bg_auto, apply_black_mask_center
+from src.utils import remove_green_bg_auto
 
 # ==========================================
-# 🏗️ MODEL ARCHITECTURE (เหมือนเดิม)
+# 🏗️ MODEL ARCHITECTURE
 # ==========================================
 class ArcMarginProduct(nn.Module):
     def __init__(self, in_features, out_features, s=30.0, m=0.50):
@@ -48,7 +47,7 @@ class PillModelGodTier(nn.Module):
         return emb
 
 # ==========================================
-# 🧠 AI ENGINE (The Brain)
+# 🧠 AI ENGINE
 # ==========================================
 class AIEngine:
     def __init__(self, config):
@@ -56,7 +55,6 @@ class AIEngine:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if torch.backends.mps.is_available(): self.device = torch.device("mps")
         
-        # Models
         self.box_detector = None
         self.box_classifier = None
         self.box_classes = []      
@@ -68,9 +66,7 @@ class AIEngine:
         self._load_models()
 
     def _load_classifier(self, weights_path, img_size):
-        if not os.path.exists(weights_path):
-            print(f"   ⚠️ Weights file not found: {weights_path}")
-            return None, []
+        if not os.path.exists(weights_path): return None, []
         try:
             checkpoint = torch.load(weights_path, map_location=self.device)
             class_names = checkpoint.get('class_names', ["Unknown"])
@@ -83,7 +79,7 @@ class AIEngine:
             model.eval()
             return model, class_names
         except Exception as e:
-            print(f"   ❌ Failed to load classifier {weights_path}: {e}")
+            print(f"❌ Error loading classifier: {e}")
             return None, []
 
     def _load_models(self):
@@ -97,26 +93,23 @@ class AIEngine:
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
 
-        # 1. LOAD BOX
+        # LOAD BOX
         box_cfg = self.cfg['model']['box_detector']
         if box_cfg.get('enabled', True):
             det_path = os.path.join(model_dir, box_cfg['onnx'])
-            if not os.path.exists(det_path): det_path = os.path.join(model_dir, "box_detector.pt")
-            if os.path.exists(det_path):
-                try: self.box_detector = YOLO(det_path, task='segment')
-                except: pass
+            try: self.box_detector = YOLO(det_path, task='segment')
+            except: pass
             cls_path = os.path.join(model_dir, box_cfg['weights'])
             self.box_classifier, self.box_classes = self._load_classifier(cls_path, box_cfg['img_size'])
             if self.box_classifier: print(f"   ✅ Box Classifier Loaded")
 
-        # 2. LOAD PILL
+        # LOAD PILL
         pill_det_cfg = self.cfg['model'].get('pill_detector', {})
         pill_cls_cfg = self.cfg['model'].get('pill_classifier', {})
         if pill_det_cfg.get('enabled', True):
             det_path = os.path.join(model_dir, pill_det_cfg.get('onnx', 'pill_detector.onnx'))
-            if os.path.exists(det_path):
-                try: self.pill_detector = YOLO(det_path, task='segment')
-                except: pass
+            try: self.pill_detector = YOLO(det_path, task='segment')
+            except: pass
         if pill_cls_cfg.get('enabled', True):
             cls_path = os.path.join(model_dir, pill_cls_cfg['weights'])
             self.pill_model, self.pill_classes = self._load_classifier(cls_path, pill_cls_cfg['img_size'])
@@ -128,33 +121,27 @@ class AIEngine:
         results = self.box_detector(frame, verbose=False, conf=thresh)
         return results[0].boxes if results else []
 
-    def predict_pill_locations(self, frame):
-        if self.pill_detector is None: return []
+    def predict_pill_data(self, frame):
+        """
+        Return (boxes, masks)
+        """
+        if self.pill_detector is None: return [], None
         thresh = self.cfg['model']['pill_detector']['conf_threshold']
-        results = self.pill_detector(frame, verbose=False, conf=thresh) 
-        return results[0].boxes if results else []
+        # 🔥 retina_masks=True เพื่อให้ได้ Mask คุณภาพสูง
+        results = self.pill_detector(frame, verbose=False, conf=thresh, retina_masks=True) 
+        if not results: return [], None
+        return results[0].boxes, results[0].masks
 
-    # 🔥🔥🔥 อัปเดตฟังก์ชันนี้ 🔥🔥🔥
     def identify_object(self, img_crop, mode='PILL', preprocess='green_screen'):
-        """
-        ระบุชื่อยา/กล่อง
-        - preprocess='green_screen': ตัดพื้นหลังเขียว (โหมดปกติ)
-        - preprocess='qc_mask': ตัดขอบดำวงรี (โหมด QC)
-        - preprocess='none': ไม่ทำอะไรเลย
-        """
-        if img_crop is None or img_crop.size == 0: 
-            return "Error", 0.0, img_crop
+        if img_crop is None or img_crop.size == 0: return "Error", 0.0, img_crop
         
-        # 1. Image Processing Logic (New!)
+        # Preprocess
         if preprocess == 'green_screen':
             processed_img = remove_green_bg_auto(img_crop)
-        elif preprocess == 'qc_mask':
-            # ใช้ฟังก์ชันใหม่ที่สร้างใน utils.py
-            processed_img = apply_black_mask_center(img_crop)
         else:
-            processed_img = img_crop.copy()
+            processed_img = img_crop.copy() # QC Mode จัดการ Mask มาแล้ว หรือไม่ต้องการทำ
 
-        # 2. Select Model
+        # Select Model
         if mode == 'BOX':
             model = self.box_classifier
             classes = self.box_classes
@@ -164,7 +151,6 @@ class AIEngine:
             
         if model is None: return "No Model", 0.0, processed_img
 
-        # 3. Inference
         try:
             img_pil = Image.fromarray(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB))
             input_tensor = self.transform(img_pil).unsqueeze(0).to(self.device)

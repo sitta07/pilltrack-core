@@ -7,12 +7,12 @@ import numpy as np
 # ⚙️ CONFIG & SYSTEM UTILS
 # ==========================================
 def load_config(config_path="config/settings.yaml"):
-    """อ่านไฟล์ Config และแปลง Path ให้เป็น Absolute Path กันหลง"""
+    """อ่านไฟล์ Config"""
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     full_config_path = os.path.join(base_dir, config_path)
 
     if not os.path.exists(full_config_path):
-        # Fallback for testing from root
+        # Fallback case
         full_config_path = os.path.abspath(config_path)
         if not os.path.exists(full_config_path):
              raise FileNotFoundError(f"❌ Config file not found at: {full_config_path}")
@@ -23,11 +23,10 @@ def load_config(config_path="config/settings.yaml"):
         
     config['system'] = config.get('system', {})
     config['system']['base_dir'] = base_dir
-    
     return config
 
 def find_working_camera():
-    """วนหา Camera Index ที่ใช้งานได้จริง (0-9)"""
+    """วนหา Camera Index (0-9)"""
     print("🔍 Searching for available camera...")
     for index in range(10):
         cap = cv2.VideoCapture(index)
@@ -45,7 +44,6 @@ def find_working_camera():
 # 🖼️ IMAGE PROCESSING UTILS
 # ==========================================
 def get_auto_hsv_bounds(frame, sample_size=30):
-    """สุ่มสีมุมภาพหาพื้นหลัง"""
     if frame is None or frame.shape[0] < sample_size or frame.shape[1] < sample_size:
         return np.array([0,0,0]), np.array([180,255,255])
     h, w, _ = frame.shape
@@ -61,7 +59,7 @@ def get_auto_hsv_bounds(frame, sample_size=30):
     return lower, upper
 
 def remove_green_bg_auto(image):
-    """ตัดพื้นหลังเขียว/ดำอัตโนมัติ (สำหรับโหมดปกติ)"""
+    """ตัดพื้นหลังเขียว/ดำอัตโนมัติ"""
     if image is None or image.size == 0: return image
     lower, upper = get_auto_hsv_bounds(image)
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
@@ -70,28 +68,21 @@ def remove_green_bg_auto(image):
     result = cv2.bitwise_and(image, image, mask=mask_inv)
     return result
 
-# 🔥🔥🔥 ฟังก์ชันใหม่สำหรับ QC Mode 🔥🔥🔥
-def apply_black_mask_center(image):
+def apply_yolo_mask(image, mask_data):
     """
-    สร้าง Mask วงรีสีดำคลุมรอบนอก เหลือไว้แค่ตรงกลาง
-    เหมาะสำหรับตัดขอบฟอยล์ใน QC Mode
+    ใช้ Mask จาก YOLO Segmentation ตัดพื้นหลัง
+    image: ภาพ Pill Crop
+    mask_data: ข้อมูล Mask (numpy array)
     """
-    if image is None or image.size == 0: return image
+    if image is None or mask_data is None: return image
     h, w = image.shape[:2]
     
-    # สร้างภาพสีดำขนาดเท่าภาพต้นฉบับ
-    mask = np.zeros((h, w), dtype=np.uint8)
+    # Resize mask ให้เท่ากับภาพ (เผื่อขนาดไม่ตรง)
+    mask_resized = cv2.resize(mask_data, (w, h), interpolation=cv2.INTER_NEAREST)
     
-    # วาดวงรีสีขาวตรงกลาง (พื้นที่ที่จะเก็บไว้)
-    center = (w // 2, h // 2)
-    # ปรับขนาดวงรีตามต้องการ (ตอนนี้เอาเกือบเต็มกรอบ)
-    axes = (int(w * 0.45), int(h * 0.45)) 
-    cv2.ellipse(mask, center, axes, 0, 0, 360, (255), -1)
+    # Convert to binary mask (0 or 255)
+    mask_uint8 = (mask_resized * 255).astype(np.uint8)
     
-    # เอา Mask ไปทาบกับภาพต้นฉบับ (ส่วนสีดำใน Mask จะทำให้ภาพต้นฉบับดำตาม)
-    result = cv2.bitwise_and(image, image, mask=mask)
-    
-    # (Optional) ถมดำส่วนที่ดำอยู่แล้วให้ดำสนิทจริงๆ
-    # result[mask == 0] = (0, 0, 0) 
-    
+    # Cut background
+    result = cv2.bitwise_and(image, image, mask=mask_uint8)
     return result

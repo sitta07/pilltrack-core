@@ -4,6 +4,7 @@ import time
 import threading
 import numpy as np
 import math
+from src.utils import apply_yolo_mask
 
 app = Flask(__name__)
 
@@ -20,7 +21,6 @@ qc_last_results = {}
 frame_count = 0
 SKIP_FRAMES = 3
 
-# HTML Template (เหมือนเดิม)
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -41,7 +41,7 @@ HTML_TEMPLATE = """
     </style>
 </head>
 <body>
-    <h1>💊 PillTrack AI <span style="font-size:0.5em; color:#555">v1.3 QC-Mask</span></h1>
+    <h1>💊 PillTrack AI <span style="font-size:0.5em; color:#555">v1.4 SegMask</span></h1>
     <div class="container"><img src="/video_feed"></div>
     <div class="status-bar">MODE: <span id="mode-display">LOADING...</span></div>
     <div class="controls">
@@ -72,14 +72,15 @@ HTML_TEMPLATE = """
 </html>
 """
 
-# Drawing Engine (เหมือนเดิม)
 def draw_overlay(frame, mode, results):
     display = frame.copy()
     h, w, _ = display.shape
+    
     cv2.rectangle(display, (0, 0), (w, 50), (0, 0, 0), -1)
     color_map = {'BOX': (0, 255, 255), 'PILL': (0, 255, 0), 'QC': (255, 0, 255)}
     cv2.putText(display, f"MODE: {mode}", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color_map.get(mode, (255,255,255)), 2)
 
+    # PIP Preview
     preview_img = results.get('preview_img')
     if preview_img is not None:
         try:
@@ -87,7 +88,7 @@ def draw_overlay(frame, mode, results):
             conf = results.get('pill_conf', results.get('conf', 0))
             border = (0, 255, 0) if conf > 0.6 else (0, 0, 255)
             mini = cv2.copyMakeBorder(mini, 2, 2, 2, 2, cv2.BORDER_CONSTANT, value=border)
-            mh, mw, _ = mini.shape
+            mh, mw = mini.shape[:2]
             y_off, x_off = 60, w - mw - 20
             display[y_off:y_off+mh, x_off:x_off+mw] = mini
             cv2.putText(display, "Target (Masked)", (x_off, y_off - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
@@ -131,12 +132,12 @@ def draw_overlay(frame, mode, results):
 
     return display
 
-# Core Loop (Optimized)
 def generate_frames():
     global frame_count, qc_last_results
     while True:
         frame = camera.read()
         if frame is None: time.sleep(0.01); continue
+        
         if zoom_level > 1.0:
             h, w, _ = frame.shape
             new_w, new_h = int(w/zoom_level), int(h/zoom_level)
@@ -145,12 +146,11 @@ def generate_frames():
 
         results = {}
         with lock: mode = current_mode
-        
         should_run_ai = (frame_count % SKIP_FRAMES == 0)
         if 'mode' not in qc_last_results or qc_last_results['mode'] != mode: should_run_ai = True 
 
         if should_run_ai:
-            # 🔥 AI PROCESSING 🔥
+            # 🧠 AI PROCESSING
             if mode == 'BOX':
                 boxes = ai_engine.predict_box_locations(frame)
                 box_res = []
@@ -160,7 +160,6 @@ def generate_frames():
                     bx1, by1 = max(0, x1-pad), max(0, y1-pad)
                     bx2, by2 = min(w_img, x2+pad), min(h_img, y2+pad)
                     crop = frame[by1:by2, bx1:bx2]
-                    # 🔥 Use 'green_screen' for BOX
                     name, conf, _ = ai_engine.identify_object(crop, mode='BOX', preprocess='green_screen')
                     box_res.append({'coords':(x1,y1,x2,y2), 'name':name, 'conf':conf})
                 results['box_data'] = box_res
@@ -175,7 +174,6 @@ def generate_frames():
                     px1, py1 = max(0, x1-pad), max(0, y1-pad)
                     px2, py2 = min(w_img, x2+pad), min(h_img, y2+pad)
                     crop = frame[py1:py2, px1:px2]
-                    # 🔥 Use 'green_screen' for PILL
                     name, conf, proc = ai_engine.identify_object(crop, mode='PILL', preprocess='green_screen')
                     results.update({'coords':(x1,y1,x2-x1,y2-y1), 'name':name, 'conf':conf, 'preview_img':proc})
                 else:
@@ -188,34 +186,51 @@ def generate_frames():
                 pack_boxes = ai_engine.predict_box_locations(frame)
                 qc_data = []
                 pack_boxes = sorted(pack_boxes, key=lambda b: (b.xyxy[0][2]-b.xyxy[0][0])*(b.xyxy[0][3]-b.xyxy[0][1]), reverse=True)
+                
                 for p_box in pack_boxes:
                     bx1, by1, bx2, by2 = map(int, p_box.xyxy[0])
                     pack_crop = frame[by1:by2, bx1:bx2]
                     
-                    # A. Identify Pack (Still use green screen logic as fallback)
+                    # A. Identify Pack (Green Screen Fallback)
                     pack_name, pack_conf, _ = ai_engine.identify_object(pack_crop, mode='BOX', preprocess='green_screen')
                     
-                    # B. Find Pills
-                    pill_locs = ai_engine.predict_pill_locations(pack_crop)
+                    # B. Find Pills & Masks Inside
+                    pill_boxes, pill_masks = ai_engine.predict_pill_data(pack_crop)
                     all_pills_coords = []; selected_pill_data = None
                     pack_h, pack_w = pack_crop.shape[:2]; pack_cx, pack_cy = pack_w//2, pack_h//2
-                    min_dist = float('inf'); best_pill_box = None
+                    min_dist = float('inf')
                     
-                    for pl in pill_locs:
-                        px1, py1, px2, py2 = map(int, pl.xyxy[0])
-                        all_pills_coords.append((bx1+px1, by1+py1, bx1+px2, by1+py2))
-                        dist = math.hypot((px1+px2)//2 - pack_cx, (py1+py2)//2 - pack_cy)
-                        if dist < min_dist:
-                            min_dist = dist; best_pill_box = (px1, py1, px2, py2)
-                            selected_pill_data = {'global_coords': (bx1+px1, by1+py1, bx1+px2, by1+py2)}
+                    if pill_boxes is not None:
+                        for i, box in enumerate(pill_boxes):
+                            px1, py1, px2, py2 = map(int, box.xyxy[0])
+                            all_pills_coords.append((bx1+px1, by1+py1, bx1+px2, by1+py2))
+                            
+                            dist = math.hypot((px1+px2)//2 - pack_cx, (py1+py2)//2 - pack_cy)
+                            if dist < min_dist:
+                                min_dist = dist
+                                mask_data = pill_masks[i].data[0].cpu().numpy() if pill_masks is not None else None
+                                selected_pill_data = {
+                                    'box': (px1, py1, px2, py2),
+                                    'mask': mask_data,
+                                    'global_coords': (bx1+px1, by1+py1, bx1+px2, by1+py2)
+                                }
 
                     # C. Identify Selected Pill
                     pill_name = "Scanning..."; pill_conf = 0.0; pill_preview = None
-                    if best_pill_box:
-                        px1, py1, px2, py2 = best_pill_box
+                    if selected_pill_data:
+                        px1, py1, px2, py2 = selected_pill_data['box']
                         pill_crop = pack_crop[py1:py2, px1:px2]
-                        # 🔥🔥🔥 QC MODE: USE 'qc_mask' HERE! 🔥🔥🔥
-                        pill_name, pill_conf, pill_preview = ai_engine.identify_object(pill_crop, mode='PILL', preprocess='qc_mask')
+                        
+                        # 🔥 MASKING LOGIC 🔥
+                        full_mask = selected_pill_data['mask']
+                        if full_mask is not None:
+                            # Crop mask to match pill size
+                            pill_mask = full_mask[py1:py2, px1:px2]
+                            masked_pill_img = apply_yolo_mask(pill_crop, pill_mask)
+                        else:
+                            masked_pill_img = pill_crop
+                            
+                        pill_name, pill_conf, pill_preview = ai_engine.identify_object(masked_pill_img, mode='PILL', preprocess='none')
                         results['preview_img'] = pill_preview
                         results['pill_conf'] = pill_conf
 
@@ -226,7 +241,7 @@ def generate_frames():
             results['mode'] = mode
             qc_last_results = results
         else:
-            results = qc_last_results # Use Cache
+            results = qc_last_results
             if 'preview_img' in qc_last_results: results['preview_img'] = qc_last_results['preview_img']
 
         final_frame = draw_overlay(frame, mode, results)
@@ -235,7 +250,6 @@ def generate_frames():
         if not ret: continue
         yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
 
-# Routes & Server Start (เหมือนเดิม)
 @app.route('/')
 def index(): return render_template_string(HTML_TEMPLATE)
 @app.route('/video_feed')
