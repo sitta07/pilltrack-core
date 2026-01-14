@@ -115,31 +115,31 @@ class AIEngine:
             self.pill_model, self.pill_classes = self._load_classifier(cls_path, pill_cls_cfg['img_size'])
             if self.pill_model: print(f"   ✅ Pill Classifier Loaded")
 
+    # --- INFERENCE METHODS ---
+
     def predict_box_locations(self, frame):
         if self.box_detector is None: return []
         thresh = self.cfg['model']['box_detector']['conf_threshold']
         results = self.box_detector(frame, verbose=False, conf=thresh)
         return results[0].boxes if results else []
 
-    def predict_pill_data(self, frame):
-        """
-        Return (boxes, masks)
-        """
-        if self.pill_detector is None: return [], None
+    # 🔥🔥🔥 กู้คืนฟังก์ชันนี้กลับมาครับ! 🔥🔥🔥
+    def predict_pill_locations(self, frame):
+        """คืนค่าเฉพาะ Box locations (ไม่เอา Mask)"""
+        if self.pill_detector is None: return []
         thresh = self.cfg['model']['pill_detector']['conf_threshold']
-        # 🔥 retina_masks=True เพื่อให้ได้ Mask คุณภาพสูง
-        results = self.pill_detector(frame, verbose=False, conf=thresh, retina_masks=True) 
-        if not results: return [], None
-        return results[0].boxes, results[0].masks
+        # ใช้ YOLO แบบปกติ (ไม่ต้อง retina_masks=True)
+        results = self.pill_detector(frame, verbose=False, conf=thresh) 
+        return results[0].boxes if results else []
 
     def identify_object(self, img_crop, mode='PILL', preprocess='green_screen'):
         if img_crop is None or img_crop.size == 0: return "Error", 0.0, img_crop
         
-        # Preprocess
+        # Logic Preprocess แบบเดิม (Classic)
         if preprocess == 'green_screen':
             processed_img = remove_green_bg_auto(img_crop)
         else:
-            processed_img = img_crop.copy() # QC Mode จัดการ Mask มาแล้ว หรือไม่ต้องการทำ
+            processed_img = img_crop.copy()
 
         # Select Model
         if mode == 'BOX':
