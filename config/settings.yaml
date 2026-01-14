@@ -1,32 +1,37 @@
 system:
   device_name: "RaspberryPi_Unit_1"
-  version: "1.0.0"
-  debug_mode: false
+  version: "1.2.0"
   
 camera:
-  index: 0          # ค่าเริ่มต้น (เดี๋ยว code จะมี auto-detect อีกที)
+  index: 0
   width: 1280
   height: 720
-  fps: 30
 
 model:
-  base_path: "models/active"  # Path สัมพัทธ์จาก root project
-  
+  base_path: "models/active"
+
+  # 📦 1. ระบบหากล่อง (YOLO)
   box_detector:
     enabled: true
-    weights: "box_model_production.pth"
     onnx: "box_detector.onnx"
+    weights: "box_model_production.pth" # ใช้สำหรับ Classifier
     img_size: 640
-    conf_threshold: 0.50
-    padding_ratio: 0.10
+    conf_threshold: 0.50  # ความมั่นใจว่า "เจอกล่อง" (YOLO)
 
+  # 🏷️ 2. ระบบอ่านชื่อกล่อง (ArcFace)
+  box_classifier:
+    img_size: 384
+    conf_threshold: 0.70  # ความมั่นใจว่า "เป็นกล่องยี่ห้ออะไร" (เช่น Paracap)
+
+  # 💊 3. ระบบหาเม็ดยา (YOLO) - ใช้ใน QC Mode / Pill Mode
+  pill_detector:
+    enabled: true
+    onnx: "pill_detector.onnx" 
+    conf_threshold: 0.6  # ความมั่นใจว่า "เจอเม็ดยา" (YOLO) - ปกติเม็ดเล็กต้องใช้ค่าน้อยหน่อย
+
+  # 🧪 4. ระบบอ่านชื่อยา (ArcFace)
   pill_classifier:
     enabled: true
     weights: "pill_model_production.pth"
-    onnx: "pill_detector.onnx"
     img_size: 384
-    conf_threshold: 0.65  # ค่าจากโค้ดเดิมของคุณ
-    
-ui:
-  zoom_level: 1.0
-  theme: "dark"
+    conf_threshold: 0.65  # ความมั่นใจว่า "เป็นยาอะไร"

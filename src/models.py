@@ -61,7 +61,7 @@ class AIEngine:
         self.box_classes = []      
         
         # 💊 PILL SYSTEM
-        self.pill_detector = None   # YOLO (สำหรับ QC Mode)
+        self.pill_detector = None   # YOLO
         self.pill_model = None      # ArcFace (.pth)
         self.pill_classes = []
         
@@ -108,7 +108,7 @@ class AIEngine:
 
         # 1. LOAD BOX SYSTEM
         box_cfg = self.cfg['model']['box_detector']
-        if box_cfg['enabled']:
+        if box_cfg.get('enabled', True):
             # 1.1 Box Detector (YOLO)
             det_path = os.path.join(model_dir, box_cfg['onnx'])
             if not os.path.exists(det_path): det_path = os.path.join(model_dir, "box_detector.pt")
@@ -116,32 +116,36 @@ class AIEngine:
             if os.path.exists(det_path):
                 try:
                     self.box_detector = YOLO(det_path, task='segment')
-                    print("   ✅ Box Detector Loaded")
+                    print(f"   ✅ Box Detector Loaded (Thresh: {box_cfg['conf_threshold']})")
                 except: print(f"   ❌ Failed to load Box YOLO: {det_path}")
             
             # 1.2 Box Classifier (.pth)
             cls_path = os.path.join(model_dir, box_cfg['weights'])
+            # ใช้ config แยกของ classifier (ถ้ามี) หรือใช้ร่วมกัน
+            # ในที่นี้เราจะดึง img_size จาก box_detector ไปก่อน
             self.box_classifier, self.box_classes = self._load_classifier(cls_path, box_cfg['img_size'])
             if self.box_classifier:
                 print(f"   ✅ Box Classifier Loaded ({len(self.box_classes)} classes)")
 
         # 2. LOAD PILL SYSTEM
-        pill_cfg = self.cfg['model']['pill_classifier']
-        if pill_cfg['enabled']:
-            # 2.1 Pill Detector (YOLO) - สำคัญสำหรับ QC Mode
-            # (ถ้าไม่มีไฟล์แยก ให้ใช้ไฟล์เดียวกับ Box หรือ Pill Detector ตัวเดิม)
-            det_path = os.path.join(model_dir, pill_cfg.get('onnx', 'pill_detector.onnx'))
+        pill_det_cfg = self.cfg['model'].get('pill_detector', {})
+        pill_cls_cfg = self.cfg['model'].get('pill_classifier', {})
+        
+        if pill_det_cfg.get('enabled', True):
+            # 2.1 Pill Detector (YOLO)
+            det_path = os.path.join(model_dir, pill_det_cfg.get('onnx', 'pill_detector.onnx'))
             if os.path.exists(det_path):
                 try:
                     self.pill_detector = YOLO(det_path, task='segment')
-                    print("   ✅ Pill Detector (YOLO) Loaded")
+                    print(f"   ✅ Pill Detector Loaded (Thresh: {pill_det_cfg['conf_threshold']})")
                 except: print(f"   ❌ Failed to load Pill YOLO")
             else:
-                print(f"   ⚠️ Pill YOLO not found (QC Mode might fail): {det_path}")
+                print(f"   ⚠️ Pill YOLO not found: {det_path}")
 
+        if pill_cls_cfg.get('enabled', True):
             # 2.2 Pill Classifier (.pth)
-            cls_path = os.path.join(model_dir, pill_cfg['weights'])
-            self.pill_model, self.pill_classes = self._load_classifier(cls_path, pill_cfg['img_size'])
+            cls_path = os.path.join(model_dir, pill_cls_cfg['weights'])
+            self.pill_model, self.pill_classes = self._load_classifier(cls_path, pill_cls_cfg['img_size'])
             if self.pill_model:
                 print(f"   ✅ Pill Classifier Loaded ({len(self.pill_classes)} classes)")
 
@@ -150,22 +154,22 @@ class AIEngine:
     def predict_box_locations(self, frame):
         """หาตำแหน่งกล่องยา (YOLO)"""
         if self.box_detector is None: return []
-        results = self.box_detector(frame, verbose=False, conf=self.cfg['model']['box_detector']['conf_threshold'])
+        # 🔥 ดึง Conf จาก Config
+        thresh = self.cfg['model']['box_detector']['conf_threshold']
+        results = self.box_detector(frame, verbose=False, conf=thresh)
         return results[0].boxes if results else []
 
     def predict_pill_locations(self, frame):
-        """หาตำแหน่งเม็ดยา (YOLO) - ใช้สำหรับ QC Mode"""
+        """หาตำแหน่งเม็ดยา (YOLO)"""
         if self.pill_detector is None: return []
-        # ใช้ Conf ต่ำหน่อยสำหรับ QC เพราะยาในแผงอาจจะไม่ชัดเท่าเม็ดเดี่ยว
-        results = self.pill_detector(frame, verbose=False, conf=0.45) 
+        # 🔥 ดึง Conf จาก Config (Pill Detector)
+        thresh = self.cfg['model']['pill_detector']['conf_threshold']
+        results = self.pill_detector(frame, verbose=False, conf=thresh) 
         return results[0].boxes if results else []
 
     def identify_object(self, img_crop, mode='PILL', use_bg_removal=True):
         """
         ระบุชื่อยา/กล่อง (ArcFace)
-        - use_bg_removal=True: สำหรับโหมดปกติ (ตัดพื้นหลังเขียว)
-        - use_bg_removal=False: สำหรับโหมด QC (ส่องแผงฟอยล์)
-        Returns: name, confidence, processed_image
         """
         if img_crop is None or img_crop.size == 0: 
             return "Error", 0.0, img_crop
