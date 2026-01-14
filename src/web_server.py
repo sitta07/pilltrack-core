@@ -4,13 +4,13 @@ import time
 import threading
 import numpy as np
 import math
-
-# เราไม่ใช้ apply_polygon_mask แล้ว เพราะจะใช้แบบ simple box
-# from src.utils import apply_polygon_mask 
+from collections import Counter
 
 app = Flask(__name__)
 
-# Global & Config
+# ==========================================
+# ⚙️ GLOBAL STATE & CONFIG
+# ==========================================
 camera = None
 ai_engine = None
 config = None
@@ -18,11 +18,15 @@ current_mode = 'BOX'
 zoom_level = 1.0
 lock = threading.Lock()
 
-# Optimization Vars
-qc_last_results = {}
-frame_count = 0
-SKIP_FRAMES = 3 
+# 🚀 QC STATE MACHINE (ตัวจำค่าโหวต)
+qc_lock_state = {
+    'locked_name': None,  # ชื่อยาที่ชนะโหวต
+    'locked_conf': 0.0,   # ความมั่นใจเฉลี่ย
+    'vote_details': "",   # เก็บผลโหวตไว้โชว์ (เช่น Para:7, Sara:1)
+    'is_locked': False    # สถานะล็อค
+}
 
+# HTML Template (Update UI นิดหน่อย)
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -43,13 +47,13 @@ HTML_TEMPLATE = """
     </style>
 </head>
 <body>
-    <h1>💊 PillTrack AI <span style="font-size:0.5em; color:#555">v1.6 Stable</span></h1>
+    <h1>💊 PillTrack AI <span style="font-size:0.5em; color:#555">v1.7 Voter</span></h1>
     <div class="container"><img src="/video_feed"></div>
     <div class="status-bar">MODE: <span id="mode-display">LOADING...</span></div>
     <div class="controls">
         <button class="btn" id="btn-box" onclick="setMode('BOX')">📦 Box Count</button>
         <button class="btn" id="btn-pill" onclick="setMode('PILL')">💊 Single Pill</button>
-        <button class="btn" id="btn-qc" onclick="setMode('QC')">🕵️ QC Inspect</button>
+        <button class="btn" id="btn-qc" onclick="setMode('QC')">🕵️ QC Voting</button>
     </div>
     <script>
         function updateUI(mode) {
@@ -82,7 +86,7 @@ def draw_overlay(frame, mode, results):
     color_map = {'BOX': (0, 255, 255), 'PILL': (0, 255, 0), 'QC': (255, 0, 255)}
     cv2.putText(display, f"MODE: {mode}", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color_map.get(mode, (255,255,255)), 2)
 
-    # PIP Preview
+    # PIP Preview (เฉพาะโหมด Pill หรือตอนโหวตเสร็จใหม่ๆ)
     preview_img = results.get('preview_img')
     if preview_img is not None:
         try:
@@ -93,7 +97,7 @@ def draw_overlay(frame, mode, results):
             mh, mw = mini.shape[:2]
             y_off, x_off = 60, w - mw - 20
             display[y_off:y_off+mh, x_off:x_off+mw] = mini
-            cv2.putText(display, "Target", (x_off, y_off - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            cv2.putText(display, "Sample", (x_off, y_off - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
         except: pass
 
     if mode == 'BOX':
@@ -117,25 +121,35 @@ def draw_overlay(frame, mode, results):
             cv2.putText(display, f"CONF: {results['conf']:.1%}", (20, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
 
     elif mode == 'QC':
-        qc_data = results.get('qc_data', [])
-        if qc_data:
-            main_pack = qc_data[0]
-            cv2.putText(display, f"PACK: {main_pack['pack_name']}", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
-            cv2.putText(display, f"PILL: {main_pack['pill_name']}", (20, 140), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-        for pack in qc_data:
-            bx1, by1, bx2, by2 = pack['coords']
-            cv2.rectangle(display, (bx1, by1), (bx2, by2), (0, 255, 255), 3)
-            cv2.putText(display, "Pack", (bx1, by1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-            for p_coord in pack['all_pills_coords']:
-                cv2.rectangle(display, (p_coord[0], p_coord[1]), (p_coord[2], p_coord[3]), (100, 100, 100), 1)
-            if pack.get('selected_pill_coords'):
-                sx1, sy1, sx2, sy2 = pack['selected_pill_coords']
-                cv2.rectangle(display, (sx1, sy1), (sx2, sy2), (0, 255, 0), 3)
+        # 🔥 แสดงผลโหวต
+        qc_res = results.get('qc_data', {})
+        if qc_res.get('locked_name'):
+            # กล่องใหญ่ซ้ายบน
+            cv2.rectangle(display, (0, 60), (350, 200), (0,0,0), -1)
+            
+            # ชื่อผู้ชนะ
+            winner = qc_res['locked_name']
+            cv2.putText(display, f"ID: {winner}", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+            
+            # รายละเอียดคะแนน
+            details = qc_res['vote_details']
+            cv2.putText(display, f"Votes: {details}", (20, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+            
+            # สถานะ
+            status_text = "🔒 LOCKED (New pack to reset)"
+            cv2.putText(display, status_text, (20, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+
+            # วาดกล่องเขียวรอบแผง
+            if qc_res.get('pack_coords'):
+                bx1, by1, bx2, by2 = qc_res['pack_coords']
+                cv2.rectangle(display, (bx1, by1), (bx2, by2), (0, 255, 0), 4)
+                cv2.putText(display, f"{winner} (Verified)", (bx1, by1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
     return display
 
 def generate_frames():
-    global frame_count, qc_last_results
+    global qc_lock_state
+    
     while True:
         frame = camera.read()
         if frame is None: time.sleep(0.01); continue
@@ -148,110 +162,113 @@ def generate_frames():
 
         results = {}
         with lock: mode = current_mode
-        should_run_ai = (frame_count % SKIP_FRAMES == 0)
-        if 'mode' not in qc_last_results or qc_last_results['mode'] != mode: should_run_ai = True 
 
-        if should_run_ai:
-            if mode == 'BOX':
-                boxes = ai_engine.predict_box_locations(frame)
-                box_res = []
-                for box in boxes:
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    pad=10; h_img, w_img = frame.shape[:2]
-                    bx1, by1 = max(0, x1-pad), max(0, y1-pad)
-                    bx2, by2 = min(w_img, x2+pad), min(h_img, y2+pad)
-                    crop = frame[by1:by2, bx1:bx2]
-                    name, conf, _ = ai_engine.identify_object(crop, mode='BOX', preprocess='green_screen')
-                    box_res.append({'coords':(x1,y1,x2,y2), 'name':name, 'conf':conf})
-                results['box_data'] = box_res
+        if mode == 'BOX':
+            qc_lock_state['is_locked'] = False # Reset QC lock when mode changes
+            boxes = ai_engine.predict_box_locations(frame)
+            box_res = []
+            for box in boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                pad=10; h_img, w_img = frame.shape[:2]
+                bx1, by1 = max(0, x1-pad), max(0, y1-pad)
+                bx2, by2 = min(w_img, x2+pad), min(h_img, y2+pad)
+                crop = frame[by1:by2, bx1:bx2]
+                name, conf, _ = ai_engine.identify_object(crop, mode='BOX', preprocess='green_screen')
+                box_res.append({'coords':(x1,y1,x2,y2), 'name':name, 'conf':conf})
+            results['box_data'] = box_res
 
-            elif mode == 'PILL':
-                # --- SINGLE PILL MODE (ต้นฉบับ) ---
-                boxes = ai_engine.predict_box_locations(frame)
-                if len(boxes) > 0:
-                    h_img, w_img = frame.shape[:2]; cx, cy = w_img//2, h_img//2
-                    best_box = min(boxes, key=lambda b: math.hypot((b.xyxy[0][0]+b.xyxy[0][2])/2 - cx, (b.xyxy[0][1]+b.xyxy[0][3])/2 - cy))
-                    x1, y1, x2, y2 = map(int, best_box.xyxy[0])
-                    pad=20
-                    px1, py1 = max(0, x1-pad), max(0, y1-pad)
-                    px2, py2 = min(w_img, x2+pad), min(h_img, y2+pad)
-                    crop = frame[py1:py2, px1:px2]
-                    name, conf, proc = ai_engine.identify_object(crop, mode='PILL', preprocess='green_screen')
-                    results.update({'coords':(x1,y1,x2-x1,y2-y1), 'name':name, 'conf':conf, 'preview_img':proc})
-                else:
-                    h_img, w_img = frame.shape[:2]
-                    c_crop = frame[h_img//2-150:h_img//2+150, w_img//2-150:w_img//2+150]
-                    name, conf, proc = ai_engine.identify_object(c_crop, mode='PILL', preprocess='green_screen')
-                    results.update({'coords':(w_img//2-150,h_img//2-150,300,300), 'name':name, 'conf':conf, 'preview_img':proc})
+        elif mode == 'PILL':
+            qc_lock_state['is_locked'] = False
+            boxes = ai_engine.predict_box_locations(frame)
+            if len(boxes) > 0:
+                h_img, w_img = frame.shape[:2]; cx, cy = w_img//2, h_img//2
+                best_box = min(boxes, key=lambda b: math.hypot((b.xyxy[0][0]+b.xyxy[0][2])/2 - cx, (b.xyxy[0][1]+b.xyxy[0][3])/2 - cy))
+                x1, y1, x2, y2 = map(int, best_box.xyxy[0])
+                pad=20
+                px1, py1 = max(0, x1-pad), max(0, y1-pad)
+                px2, py2 = min(w_img, x2+pad), min(h_img, y2+pad)
+                crop = frame[py1:py2, px1:px2]
+                name, conf, proc = ai_engine.identify_object(crop, mode='PILL', preprocess='green_screen')
+                results.update({'coords':(x1,y1,x2-x1,y2-y1), 'name':name, 'conf':conf, 'preview_img':proc})
+            else:
+                h_img, w_img = frame.shape[:2]
+                c_crop = frame[h_img//2-150:h_img//2+150, w_img//2-150:w_img//2+150]
+                name, conf, proc = ai_engine.identify_object(c_crop, mode='PILL', preprocess='green_screen')
+                results.update({'coords':(w_img//2-150,h_img//2-150,300,300), 'name':name, 'conf':conf, 'preview_img':proc})
 
-            elif mode == 'QC':
-                # --- QC MODE REVERTED (เหมือน Single Pill) ---
-                pack_boxes = ai_engine.predict_box_locations(frame)
-                qc_data = []
+        elif mode == 'QC':
+            # 🔥 MAJORITY VOTING LOGIC 🔥
+            
+            # 1. หาแผงยาก่อน
+            pack_boxes = ai_engine.predict_box_locations(frame)
+            
+            # ถ้าไม่เจอแผง -> RESET ทุกอย่าง
+            if len(pack_boxes) == 0:
+                qc_lock_state = {
+                    'locked_name': None,
+                    'locked_conf': 0.0,
+                    'vote_details': "Waiting for pack...",
+                    'is_locked': False
+                }
+                results['qc_data'] = qc_lock_state
+            
+            else:
+                # เอาแผงที่ใหญ่ที่สุด
                 pack_boxes = sorted(pack_boxes, key=lambda b: (b.xyxy[0][2]-b.xyxy[0][0])*(b.xyxy[0][3]-b.xyxy[0][1]), reverse=True)
+                p_box = pack_boxes[0]
+                bx1, by1, bx2, by2 = map(int, p_box.xyxy[0])
                 
-                for p_box in pack_boxes:
-                    bx1, by1, bx2, by2 = map(int, p_box.xyxy[0])
+                # ถ้า Lock อยู่แล้ว -> โชว์ผลเดิมเลย (ไม่ต้องรัน AI เม็ดยาซ้ำ) -> เร็วปรื๊ด ⚡️
+                if qc_lock_state['is_locked']:
+                     qc_lock_state['pack_coords'] = (bx1, by1, bx2, by2)
+                     results['qc_data'] = qc_lock_state
+                
+                # ถ้ายังไม่ Lock -> เริ่มกระบวนการโหวต
+                else:
                     pack_crop = frame[by1:by2, bx1:bx2]
                     
-                    # A. Identify Pack
-                    pack_name, pack_conf, _ = ai_engine.identify_object(pack_crop, mode='BOX', preprocess='green_screen')
-                    
-                    # B. Find Pills Inside (ใช้ Boxes ธรรมดา ไม่เอา Masks แล้ว)
-                    # ใช้ predict_pill_locations เหมือนเดิม เพื่อเอาแค่กล่องสี่เหลี่ยม
+                    # 1. หาเม็ดยาทุกเม็ดในแผง
                     pill_boxes = ai_engine.predict_pill_locations(pack_crop)
                     
-                    all_pills_coords = []
-                    selected_pill_data = None
-                    pack_h, pack_w = pack_crop.shape[:2]
-                    pack_cx, pack_cy = pack_w // 2, pack_h // 2
-                    min_dist = float('inf')
-                    
-                    for box in pill_boxes:
-                        px1, py1, px2, py2 = map(int, box.xyxy[0])
+                    if len(pill_boxes) > 0:
+                        votes = []
+                        confs = []
                         
-                        # Global coords
-                        g_px1, g_py1, g_px2, g_py2 = bx1+px1, by1+py1, bx1+px2, by1+py2
-                        all_pills_coords.append((g_px1, g_py1, g_px2, g_py2))
+                        # 2. วนลูปทำนายทุกเม็ด
+                        for box in pill_boxes:
+                            px1, py1, px2, py2 = map(int, box.xyxy[0])
+                            pill_crop = pack_crop[py1:py2, px1:px2]
+                            
+                            # Identify (Back to Basic: Green Screen)
+                            p_name, p_conf, _ = ai_engine.identify_object(pill_crop, mode='PILL', preprocess='green_screen')
+                            
+                            votes.append(p_name)
+                            confs.append(p_conf)
                         
-                        # Find closest to center
-                        dist = math.hypot((px1+px2)//2 - pack_cx, (py1+py2)//2 - pack_cy)
-                        if dist < min_dist:
-                            min_dist = dist
-                            # เก็บข้อมูลแบบ Single Pill (Box Only)
-                            selected_pill_data = {
-                                'box': (px1, py1, px2, py2),
-                                'global_coords': (g_px1, g_py1, g_px2, g_py2)
-                            }
-
-                    # C. Identify Selected Pill (Classic Method)
-                    pill_name = "Scanning..."
-                    pill_conf = 0.0
-                    pill_preview = None
-                    
-                    if selected_pill_data:
-                        px1, py1, px2, py2 = selected_pill_data['box']
-                        pill_crop = pack_crop[py1:py2, px1:px2]
+                        # 3. นับคะแนน (Election Time!)
+                        vote_counts = Counter(votes)
+                        winner = vote_counts.most_common(1)[0][0] # ผู้ชนะ
+                        avg_conf = sum(confs) / len(confs)
                         
-                        # 🔥🔥🔥 ใช้ preprocess='green_screen' เหมือน Single Pill 🔥🔥🔥
-                        # ไม่ตัดขอบด้วย Mask แล้ว ให้ AI จัดการเองเหมือนโหมดปกติ
-                        pill_name, pill_conf, pill_preview = ai_engine.identify_object(pill_crop, mode='PILL', preprocess='green_screen')
+                        # สร้าง String แสดงผลโหวต (เช่น "Para:5, Sara:1")
+                        details_str = ", ".join([f"{k}:{v}" for k,v in vote_counts.items()])
                         
-                        results['preview_img'] = pill_preview
-                        results['pill_conf'] = pill_conf
-
-                    qc_data.append({'coords':(bx1,by1,bx2,by2), 'pack_name':pack_name, 'pill_name':pill_name, 'all_pills_coords':all_pills_coords, 'selected_pill_coords':selected_pill_data['global_coords'] if selected_pill_data else None})
-                    break 
-                results['qc_data'] = qc_data
-            
-            results['mode'] = mode
-            qc_last_results = results
-        else:
-            results = qc_last_results
-            if 'preview_img' in qc_last_results: results['preview_img'] = qc_last_results['preview_img']
+                        # 4. Lock ผลลัพธ์!
+                        qc_lock_state = {
+                            'locked_name': winner,
+                            'locked_conf': avg_conf,
+                            'vote_details': details_str,
+                            'is_locked': True,
+                            'pack_coords': (bx1, by1, bx2, by2)
+                        }
+                        results['qc_data'] = qc_lock_state
+                    else:
+                        # เจอแผงแต่ไม่เจอเม็ดยาข้างใน
+                        qc_lock_state['vote_details'] = "Pack found, No pills detected"
+                        qc_lock_state['pack_coords'] = (bx1, by1, bx2, by2)
+                        results['qc_data'] = qc_lock_state
 
         final_frame = draw_overlay(frame, mode, results)
-        frame_count += 1
         ret, buffer = cv2.imencode('.jpg', final_frame)
         if not ret: continue
         yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
