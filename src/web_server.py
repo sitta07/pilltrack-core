@@ -4,8 +4,9 @@ import time
 import threading
 import numpy as np
 import math
-# 🔥 Import ฟังก์ชันใหม่มาใช้
-from src.utils import apply_polygon_mask
+
+# เราไม่ใช้ apply_polygon_mask แล้ว เพราะจะใช้แบบ simple box
+# from src.utils import apply_polygon_mask 
 
 app = Flask(__name__)
 
@@ -42,7 +43,7 @@ HTML_TEMPLATE = """
     </style>
 </head>
 <body>
-    <h1>💊 PillTrack AI <span style="font-size:0.5em; color:#555">v1.5 PolyMask</span></h1>
+    <h1>💊 PillTrack AI <span style="font-size:0.5em; color:#555">v1.6 Stable</span></h1>
     <div class="container"><img src="/video_feed"></div>
     <div class="status-bar">MODE: <span id="mode-display">LOADING...</span></div>
     <div class="controls">
@@ -92,7 +93,7 @@ def draw_overlay(frame, mode, results):
             mh, mw = mini.shape[:2]
             y_off, x_off = 60, w - mw - 20
             display[y_off:y_off+mh, x_off:x_off+mw] = mini
-            cv2.putText(display, "Target (Poly)", (x_off, y_off - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            cv2.putText(display, "Target", (x_off, y_off - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
         except: pass
 
     if mode == 'BOX':
@@ -165,6 +166,7 @@ def generate_frames():
                 results['box_data'] = box_res
 
             elif mode == 'PILL':
+                # --- SINGLE PILL MODE (ต้นฉบับ) ---
                 boxes = ai_engine.predict_box_locations(frame)
                 if len(boxes) > 0:
                     h_img, w_img = frame.shape[:2]; cx, cy = w_img//2, h_img//2
@@ -183,6 +185,7 @@ def generate_frames():
                     results.update({'coords':(w_img//2-150,h_img//2-150,300,300), 'name':name, 'conf':conf, 'preview_img':proc})
 
             elif mode == 'QC':
+                # --- QC MODE REVERTED (เหมือน Single Pill) ---
                 pack_boxes = ai_engine.predict_box_locations(frame)
                 qc_data = []
                 pack_boxes = sorted(pack_boxes, key=lambda b: (b.xyxy[0][2]-b.xyxy[0][0])*(b.xyxy[0][3]-b.xyxy[0][1]), reverse=True)
@@ -194,9 +197,9 @@ def generate_frames():
                     # A. Identify Pack
                     pack_name, pack_conf, _ = ai_engine.identify_object(pack_crop, mode='BOX', preprocess='green_screen')
                     
-                    # B. Find Pills & Masks
-                    # ai_engine จะคืนค่า pill_boxes และ pill_masks มาให้
-                    pill_boxes, pill_masks = ai_engine.predict_pill_data(pack_crop)
+                    # B. Find Pills Inside (ใช้ Boxes ธรรมดา ไม่เอา Masks แล้ว)
+                    # ใช้ predict_pill_locations เหมือนเดิม เพื่อเอาแค่กล่องสี่เหลี่ยม
+                    pill_boxes = ai_engine.predict_pill_locations(pack_crop)
                     
                     all_pills_coords = []
                     selected_pill_data = None
@@ -204,30 +207,24 @@ def generate_frames():
                     pack_cx, pack_cy = pack_w // 2, pack_h // 2
                     min_dist = float('inf')
                     
-                    if pill_boxes is not None:
-                        for i, box in enumerate(pill_boxes):
-                            px1, py1, px2, py2 = map(int, box.xyxy[0])
-                            
-                            # Global coords for drawing
-                            g_px1, g_py1, g_px2, g_py2 = bx1+px1, by1+py1, bx1+px2, by1+py2
-                            all_pills_coords.append((g_px1, g_py1, g_px2, g_py2))
-                            
-                            # Find Closest to Center
-                            dist = math.hypot((px1+px2)//2 - pack_cx, (py1+py2)//2 - pack_cy)
-                            if dist < min_dist:
-                                min_dist = dist
-                                
-                                # 🔥 แก้ไข: ดึง Polygon (.xy) แทน Bitmap Mask 🔥
-                                # pill_masks[i].xy[0] คือ array ของพิกัดจุดรอบๆ เม็ดยา
-                                poly = pill_masks[i].xy[0] if pill_masks is not None else None
-                                
-                                selected_pill_data = {
-                                    'box': (px1, py1, px2, py2),
-                                    'polygon': poly, # เก็บ Polygon ไว้ใช้
-                                    'global_coords': (g_px1, g_py1, g_px2, g_py2)
-                                }
+                    for box in pill_boxes:
+                        px1, py1, px2, py2 = map(int, box.xyxy[0])
+                        
+                        # Global coords
+                        g_px1, g_py1, g_px2, g_py2 = bx1+px1, by1+py1, bx1+px2, by1+py2
+                        all_pills_coords.append((g_px1, g_py1, g_px2, g_py2))
+                        
+                        # Find closest to center
+                        dist = math.hypot((px1+px2)//2 - pack_cx, (py1+py2)//2 - pack_cy)
+                        if dist < min_dist:
+                            min_dist = dist
+                            # เก็บข้อมูลแบบ Single Pill (Box Only)
+                            selected_pill_data = {
+                                'box': (px1, py1, px2, py2),
+                                'global_coords': (g_px1, g_py1, g_px2, g_py2)
+                            }
 
-                    # C. Identify Selected Pill
+                    # C. Identify Selected Pill (Classic Method)
                     pill_name = "Scanning..."
                     pill_conf = 0.0
                     pill_preview = None
@@ -236,16 +233,9 @@ def generate_frames():
                         px1, py1, px2, py2 = selected_pill_data['box']
                         pill_crop = pack_crop[py1:py2, px1:px2]
                         
-                        # 🔥 MASKING: ใช้ Polygon Mask 🔥
-                        polygon = selected_pill_data['polygon']
-                        if polygon is not None:
-                            # ส่ง px1, py1 เพื่อให้รู้ offset
-                            masked_pill_img = apply_polygon_mask(pill_crop, polygon, (px1, py1))
-                        else:
-                            masked_pill_img = pill_crop
-                            
-                        # Identify (ไม่ต้อง Preprocess ซ้ำ)
-                        pill_name, pill_conf, pill_preview = ai_engine.identify_object(masked_pill_img, mode='PILL', preprocess='none')
+                        # 🔥🔥🔥 ใช้ preprocess='green_screen' เหมือน Single Pill 🔥🔥🔥
+                        # ไม่ตัดขอบด้วย Mask แล้ว ให้ AI จัดการเองเหมือนโหมดปกติ
+                        pill_name, pill_conf, pill_preview = ai_engine.identify_object(pill_crop, mode='PILL', preprocess='green_screen')
                         
                         results['preview_img'] = pill_preview
                         results['pill_conf'] = pill_conf
