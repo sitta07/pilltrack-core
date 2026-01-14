@@ -24,7 +24,14 @@ STREAM_WIDTH = 1280
 JPEG_QUALITY = 90        
 
 # State Variables
-qc_state = {'locked': False, 'winner_name': "...", 'vote_stats': "", 'avg_conf': 0.0}
+# เพิ่ม 'locked_preview' ไว้เก็บรูปยาที่ชนะโหวต
+qc_state = {
+    'locked': False, 
+    'winner_name': "...", 
+    'vote_stats': "", 
+    'avg_conf': 0.0,
+    'locked_preview': None  # 🔥 รูปที่จะล็อคไว้โชว์
+}
 frame_count = 0
 qc_last_results = {}
 
@@ -53,7 +60,7 @@ HTML_TEMPLATE = """
     </style>
 </head>
 <body>
-    <h2>💊 PillTrack AI <span style="font-size:0.6em; color:#00ff00">v2.1 PIP-All</span></h2>
+    <h2>💊 PillTrack AI <span style="font-size:0.6em; color:#00ff00">v2.2 LockedPIP</span></h2>
     <div class="container"><img src="/video_feed"></div>
     <div class="status-bar">MODE: <span id="mode-display" style="color:#ffeb3b">...</span></div>
     <div style="margin-top:15px">
@@ -89,32 +96,33 @@ def draw_overlay(frame, mode, results):
     color_map = {'BOX': (0, 255, 255), 'PILL': (0, 255, 0), 'QC': (255, 0, 255)}
     cv2.putText(display, f"MODE: {mode}", (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color_map.get(mode, (255,255,255)), 3)
 
-    # 🔥🔥 PIP PREVIEW (SHOW IN ALL MODES) 🔥🔥
+    # 🔥🔥 PIP PREVIEW (LOCKED LOGIC) 🔥🔥
     if results.get('preview_img') is not None:
         try:
-            # Resize ให้เป็นสี่เหลี่ยมจัตุรัส 180x180
             mini_size = 180
             mini = cv2.resize(results['preview_img'], (mini_size, mini_size))
             
-            # ใส่กรอบสีตามความมั่นใจ
+            # Border Color logic
             conf = results.get('conf', 0.0)
-            if mode == 'QC' and results.get('qc_data'): 
-                conf = 1.0 if qc_state['locked'] else 0.5 # QC Locked = Green
-            
-            border_color = (0, 255, 0) if conf > 0.6 else (0, 0, 255)
+            if mode == 'QC':
+                # ถ้า QC Lock แล้ว ให้กรอบเขียวเสมอ
+                border_color = (0, 255, 0) if qc_state['locked'] else (0, 255, 255)
+            else:
+                border_color = (0, 255, 0) if conf > 0.6 else (0, 0, 255)
+
             mini = cv2.copyMakeBorder(mini, 3, 3, 3, 3, cv2.BORDER_CONSTANT, value=border_color)
             
-            # วางมุมขวาบน
+            # Position: Top Right
             mh, mw = mini.shape[:2]
             y_off = 70
             x_off = w - mw - 20
             
-            # วาดพื้นหลังสีดำรองรับรูป
             cv2.rectangle(display, (x_off, y_off - 30), (x_off + mw, y_off + mh), (0,0,0), -1)
             display[y_off:y_off+mh, x_off:x_off+mw] = mini
             
             # Label
-            cv2.putText(display, "AI Input", (x_off, y_off - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+            label = "LOCKED" if (mode=='QC' and qc_state['locked']) else "AI INPUT"
+            cv2.putText(display, label, (x_off, y_off - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
         except Exception as e: 
             print(f"PIP Error: {e}")
 
@@ -177,7 +185,9 @@ def generate_frames():
         results = {}
         with lock: mode = current_mode
 
-        if mode != 'QC': qc_state['locked'] = False
+        if mode != 'QC': 
+            qc_state['locked'] = False
+            qc_state['locked_preview'] = None # Clear locked image
 
         should_run_ai = (frame_count % SKIP_FRAMES == 0) or (not qc_last_results)
         
@@ -185,8 +195,6 @@ def generate_frames():
             if mode == 'BOX':
                 boxes = ai_engine.predict_box_locations(frame)
                 box_res = []
-                
-                # ตัวแปรหา Best Box เพื่อเอามาโชว์ Preview
                 best_conf = -1
                 best_preview = None
 
@@ -198,7 +206,6 @@ def generate_frames():
                     crop = frame[by1:by2, bx1:bx2]
                     name, conf, proc = ai_engine.identify_object(crop, mode='BOX', preprocess='green_screen')
                     
-                    # เก็บ Preview ของตัวที่มั่นใจที่สุด
                     if conf > best_conf:
                         best_conf = conf
                         best_preview = proc
@@ -206,10 +213,8 @@ def generate_frames():
                     box_res.append({'coords':(x1,y1,x2,y2), 'name':name, 'conf':conf})
                 
                 results['box_data'] = box_res
-                # 🔥 ส่ง Preview ไปแสดงผล
                 if best_preview is not None:
                     results['preview_img'] = best_preview
-                    results['conf'] = best_conf
 
             elif mode == 'PILL':
                 boxes = ai_engine.predict_box_locations(frame)
@@ -220,15 +225,16 @@ def generate_frames():
                     pad=20; px1, py1 = max(0, x1-pad), max(0, y1-pad); px2, py2 = min(w_img, x2+pad), min(h_img, y2+pad)
                     crop = frame[py1:py2, px1:px2]
                     name, conf, proc = ai_engine.identify_object(crop, mode='PILL', preprocess='green_screen')
-                    
-                    # 🔥 ส่ง Preview
                     results.update({'coords':(x1,y1,x2-x1,y2-y1), 'name':name, 'conf':conf, 'preview_img':proc})
 
             elif mode == 'QC':
                 pack_boxes = ai_engine.predict_box_locations(frame)
                 
                 if not pack_boxes:
-                    qc_state = {'locked': False, 'winner_name': "...", 'vote_stats': "", 'avg_conf': 0.0}
+                    qc_state = {
+                        'locked': False, 'winner_name': "...", 
+                        'vote_stats': "", 'avg_conf': 0.0, 'locked_preview': None
+                    }
                     results['qc_data'] = {}
                 else:
                     pack_boxes = sorted(pack_boxes, key=lambda b: (b.xyxy[0][2]-b.xyxy[0][0])*(b.xyxy[0][3]-b.xyxy[0][1]), reverse=True)
@@ -237,38 +243,51 @@ def generate_frames():
                     pack_crop = frame[by1:by2, bx1:bx2]
                     
                     pack_name, _, _ = ai_engine.identify_object(pack_crop, mode='BOX', preprocess='green_screen')
-                    
                     pill_boxes = ai_engine.predict_pill_locations(pack_crop)
+                    
                     pills_coords = []
-                    
-                    # ตัวแปรเก็บ Preview เม็ดตัวอย่าง
-                    sample_preview = None
-                    
+                    live_sample_preview = None # รูปตัวอย่างชั่วคราว (ถ้ายังไม่ล็อค)
+
                     for pb in pill_boxes:
                         px1, py1, px2, py2 = map(int, pb.xyxy[0])
                         pills_coords.append((bx1+px1, by1+py1, bx1+px2, by1+py2))
                         
-                        # ถ้ายังไม่มี Preview ให้เอาเม็ดแรกมาโชว์ก่อน (เพื่อให้ User เห็นว่า AI ตัดภาพยังไง)
-                        if sample_preview is None:
-                            pill_crop = pack_crop[py1:py2, px1:px2]
-                            _, _, sample_preview = ai_engine.identify_object(pill_crop, mode='PILL', preprocess='green_screen')
+                        # ถ้ายังไม่ล็อค ให้เก็บตัวอย่างรูปแรกไว้โชว์
+                        if not qc_state['locked'] and live_sample_preview is None:
+                             pill_crop = pack_crop[py1:py2, px1:px2]
+                             _, _, live_sample_preview = ai_engine.identify_object(pill_crop, mode='PILL', preprocess='green_screen')
 
+                    # Voting Phase
                     if not qc_state['locked'] and len(pill_boxes) > 0:
                         votes = []
+                        # เก็บรูปของทุกเม็ดที่โหวต เพื่อหาตัวแทนผู้ชนะ
+                        candidate_previews = [] 
+
                         for pb in pill_boxes:
                             px1, py1, px2, py2 = map(int, pb.xyxy[0])
                             pill_crop = pack_crop[py1:py2, px1:px2]
-                            p_name, _, _ = ai_engine.identify_object(pill_crop, mode='PILL', preprocess='green_screen')
+                            p_name, _, p_preview = ai_engine.identify_object(pill_crop, mode='PILL', preprocess='green_screen')
                             votes.append(p_name)
+                            candidate_previews.append((p_name, p_preview))
                         
                         if votes:
                             vote_counts = Counter(votes)
                             winner = vote_counts.most_common(1)[0][0]
                             stats_str = ", ".join([f"{k}:{v}" for k,v in vote_counts.items()])
+                            
+                            # หาภาพตัวอย่างของผู้ชนะ (Winning Image)
+                            winning_preview = None
+                            for name, img in candidate_previews:
+                                if name == winner:
+                                    winning_preview = img
+                                    break
+                            
+                            # Lock Result & Image
                             qc_state['locked'] = True
                             qc_state['winner_name'] = winner
                             qc_state['vote_stats'] = stats_str
-                    
+                            qc_state['locked_preview'] = winning_preview # 🔥 LOCK IMAGE HERE
+
                     results['qc_data'] = {
                         'pack_coords': (bx1, by1, bx2, by2),
                         'pack_name': pack_name,
@@ -277,9 +296,14 @@ def generate_frames():
                         'pill_name': qc_state['winner_name'],
                         'vote_stats': qc_state['vote_stats']
                     }
-                    # 🔥 ส่ง Preview เม็ดตัวอย่าง
-                    if sample_preview is not None:
-                        results['preview_img'] = sample_preview
+                    
+                    # 🔥 Logic การแสดง Preview
+                    if qc_state['locked']:
+                        # ถ้าล็อคแล้ว ให้ใช้รูปที่ล็อคไว้เสมอ
+                        results['preview_img'] = qc_state['locked_preview']
+                    else:
+                        # ถ้ายังไม่ล็อค ให้โชว์รูปที่สแกนอยู่สดๆ
+                        results['preview_img'] = live_sample_preview
 
             qc_last_results = results
         else:
@@ -315,5 +339,5 @@ def get_mode_route(): return jsonify(mode=current_mode)
 def start_server(_camera, _engine, _config):
     global camera, ai_engine, config
     camera = _camera; ai_engine = _engine; config = _config
-    print(f"🌍 Web Interface running (Full PIP Mode) at http://0.0.0.0:5000")
+    print(f"🌍 Web Interface running (LockedPIP Mode) at http://0.0.0.0:5000")
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
