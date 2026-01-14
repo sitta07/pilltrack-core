@@ -12,7 +12,6 @@ def load_config(config_path="config/settings.yaml"):
     full_config_path = os.path.join(base_dir, config_path)
 
     if not os.path.exists(full_config_path):
-        # Fallback case
         full_config_path = os.path.abspath(config_path)
         if not os.path.exists(full_config_path):
              raise FileNotFoundError(f"❌ Config file not found at: {full_config_path}")
@@ -26,7 +25,7 @@ def load_config(config_path="config/settings.yaml"):
     return config
 
 def find_working_camera():
-    """วนหา Camera Index (0-9)"""
+    """วนหา Camera Index"""
     print("🔍 Searching for available camera...")
     for index in range(10):
         cap = cv2.VideoCapture(index)
@@ -59,7 +58,7 @@ def get_auto_hsv_bounds(frame, sample_size=30):
     return lower, upper
 
 def remove_green_bg_auto(image):
-    """ตัดพื้นหลังเขียว/ดำอัตโนมัติ"""
+    """ตัดพื้นหลังเขียว/ดำอัตโนมัติ (สำหรับโหมดปกติ)"""
     if image is None or image.size == 0: return image
     lower, upper = get_auto_hsv_bounds(image)
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
@@ -68,21 +67,37 @@ def remove_green_bg_auto(image):
     result = cv2.bitwise_and(image, image, mask=mask_inv)
     return result
 
-def apply_yolo_mask(image, mask_data):
+# 🔥🔥🔥 ฟังก์ชันพระเอกของเรา (Polygon Masking) 🔥🔥🔥
+def apply_polygon_mask(image, polygon, crop_offset):
     """
-    ใช้ Mask จาก YOLO Segmentation ตัดพื้นหลัง
-    image: ภาพ Pill Crop
-    mask_data: ข้อมูล Mask (numpy array)
+    ใช้ Polygon (จุดพิกัด) ตัดขอบยา รับประกันว่าทรงไม่เบี้ยว 100%
+    
+    Args:
+        image: ภาพ Pill Crop (เม็ดเดียว)
+        polygon: จุดพิกัดรอบเม็ดยา (Global Coordinates จากภาพใหญ่)
+        crop_offset: (x1, y1) จุดมุมซ้ายบนของ Pill Crop
     """
-    if image is None or mask_data is None: return image
+    if image is None or polygon is None or len(polygon) == 0: return image
+    
     h, w = image.shape[:2]
+    crop_x, crop_y = crop_offset
     
-    # Resize mask ให้เท่ากับภาพ (เผื่อขนาดไม่ตรง)
-    mask_resized = cv2.resize(mask_data, (w, h), interpolation=cv2.INTER_NEAREST)
+    # 1. สร้างหน้ากากสีดำขนาดเท่าภาพ Crop
+    mask = np.zeros((h, w), dtype=np.uint8)
     
-    # Convert to binary mask (0 or 255)
-    mask_uint8 = (mask_resized * 255).astype(np.uint8)
+    # 2. แปลงพิกัดจาก Global (ทั้งภาพ) -> Local (เฉพาะใน Crop)
+    # สูตร: จุดใน crop = จุดจริง - จุดเริ่มต้น crop
+    # ต้อง copy ออกมาเพื่อไม่ให้กระทบค่าเดิม
+    local_polygon = polygon.copy()
+    local_polygon[:, 0] -= crop_x
+    local_polygon[:, 1] -= crop_y
     
-    # Cut background
-    result = cv2.bitwise_and(image, image, mask=mask_uint8)
+    # 3. วาดรูปทรงยาลงบนหน้ากาก (Filled Polygon = สีขาว 255)
+    # ต้องแปลงเป็น int32 ก่อนวาดด้วย opencv
+    points = local_polygon.astype(np.int32)
+    cv2.fillPoly(mask, [points], 255)
+    
+    # 4. ตัดภาพ (พื้นหลังจะเป็นสีดำสนิท)
+    result = cv2.bitwise_and(image, image, mask=mask)
+    
     return result

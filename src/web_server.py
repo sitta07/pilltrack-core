@@ -4,7 +4,8 @@ import time
 import threading
 import numpy as np
 import math
-from src.utils import apply_yolo_mask
+# 🔥 Import ฟังก์ชันใหม่มาใช้
+from src.utils import apply_polygon_mask
 
 app = Flask(__name__)
 
@@ -16,10 +17,10 @@ current_mode = 'BOX'
 zoom_level = 1.0
 lock = threading.Lock()
 
-# Optimization
+# Optimization Vars
 qc_last_results = {}
 frame_count = 0
-SKIP_FRAMES = 3
+SKIP_FRAMES = 3 
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -41,7 +42,7 @@ HTML_TEMPLATE = """
     </style>
 </head>
 <body>
-    <h1>💊 PillTrack AI <span style="font-size:0.5em; color:#555">v1.4 SegMask</span></h1>
+    <h1>💊 PillTrack AI <span style="font-size:0.5em; color:#555">v1.5 PolyMask</span></h1>
     <div class="container"><img src="/video_feed"></div>
     <div class="status-bar">MODE: <span id="mode-display">LOADING...</span></div>
     <div class="controls">
@@ -91,7 +92,7 @@ def draw_overlay(frame, mode, results):
             mh, mw = mini.shape[:2]
             y_off, x_off = 60, w - mw - 20
             display[y_off:y_off+mh, x_off:x_off+mw] = mini
-            cv2.putText(display, "Target (Masked)", (x_off, y_off - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            cv2.putText(display, "Target (Poly)", (x_off, y_off - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
         except: pass
 
     if mode == 'BOX':
@@ -150,7 +151,6 @@ def generate_frames():
         if 'mode' not in qc_last_results or qc_last_results['mode'] != mode: should_run_ai = True 
 
         if should_run_ai:
-            # 🧠 AI PROCESSING
             if mode == 'BOX':
                 boxes = ai_engine.predict_box_locations(frame)
                 box_res = []
@@ -191,46 +191,62 @@ def generate_frames():
                     bx1, by1, bx2, by2 = map(int, p_box.xyxy[0])
                     pack_crop = frame[by1:by2, bx1:bx2]
                     
-                    # A. Identify Pack (Green Screen Fallback)
+                    # A. Identify Pack
                     pack_name, pack_conf, _ = ai_engine.identify_object(pack_crop, mode='BOX', preprocess='green_screen')
                     
-                    # B. Find Pills & Masks Inside
+                    # B. Find Pills & Masks
+                    # ai_engine จะคืนค่า pill_boxes และ pill_masks มาให้
                     pill_boxes, pill_masks = ai_engine.predict_pill_data(pack_crop)
-                    all_pills_coords = []; selected_pill_data = None
-                    pack_h, pack_w = pack_crop.shape[:2]; pack_cx, pack_cy = pack_w//2, pack_h//2
+                    
+                    all_pills_coords = []
+                    selected_pill_data = None
+                    pack_h, pack_w = pack_crop.shape[:2]
+                    pack_cx, pack_cy = pack_w // 2, pack_h // 2
                     min_dist = float('inf')
                     
                     if pill_boxes is not None:
                         for i, box in enumerate(pill_boxes):
                             px1, py1, px2, py2 = map(int, box.xyxy[0])
-                            all_pills_coords.append((bx1+px1, by1+py1, bx1+px2, by1+py2))
                             
+                            # Global coords for drawing
+                            g_px1, g_py1, g_px2, g_py2 = bx1+px1, by1+py1, bx1+px2, by1+py2
+                            all_pills_coords.append((g_px1, g_py1, g_px2, g_py2))
+                            
+                            # Find Closest to Center
                             dist = math.hypot((px1+px2)//2 - pack_cx, (py1+py2)//2 - pack_cy)
                             if dist < min_dist:
                                 min_dist = dist
-                                mask_data = pill_masks[i].data[0].cpu().numpy() if pill_masks is not None else None
+                                
+                                # 🔥 แก้ไข: ดึง Polygon (.xy) แทน Bitmap Mask 🔥
+                                # pill_masks[i].xy[0] คือ array ของพิกัดจุดรอบๆ เม็ดยา
+                                poly = pill_masks[i].xy[0] if pill_masks is not None else None
+                                
                                 selected_pill_data = {
                                     'box': (px1, py1, px2, py2),
-                                    'mask': mask_data,
-                                    'global_coords': (bx1+px1, by1+py1, bx1+px2, by1+py2)
+                                    'polygon': poly, # เก็บ Polygon ไว้ใช้
+                                    'global_coords': (g_px1, g_py1, g_px2, g_py2)
                                 }
 
                     # C. Identify Selected Pill
-                    pill_name = "Scanning..."; pill_conf = 0.0; pill_preview = None
+                    pill_name = "Scanning..."
+                    pill_conf = 0.0
+                    pill_preview = None
+                    
                     if selected_pill_data:
                         px1, py1, px2, py2 = selected_pill_data['box']
                         pill_crop = pack_crop[py1:py2, px1:px2]
                         
-                        # 🔥 MASKING LOGIC 🔥
-                        full_mask = selected_pill_data['mask']
-                        if full_mask is not None:
-                            # Crop mask to match pill size
-                            pill_mask = full_mask[py1:py2, px1:px2]
-                            masked_pill_img = apply_yolo_mask(pill_crop, pill_mask)
+                        # 🔥 MASKING: ใช้ Polygon Mask 🔥
+                        polygon = selected_pill_data['polygon']
+                        if polygon is not None:
+                            # ส่ง px1, py1 เพื่อให้รู้ offset
+                            masked_pill_img = apply_polygon_mask(pill_crop, polygon, (px1, py1))
                         else:
                             masked_pill_img = pill_crop
                             
+                        # Identify (ไม่ต้อง Preprocess ซ้ำ)
                         pill_name, pill_conf, pill_preview = ai_engine.identify_object(masked_pill_img, mode='PILL', preprocess='none')
+                        
                         results['preview_img'] = pill_preview
                         results['pill_conf'] = pill_conf
 
