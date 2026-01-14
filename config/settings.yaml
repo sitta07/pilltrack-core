@@ -1,0 +1,32 @@
+system:
+  device_name: "RaspberryPi_Unit_1"
+  version: "1.0.0"
+  debug_mode: false
+  
+camera:
+  index: 0          # ค่าเริ่มต้น (เดี๋ยว code จะมี auto-detect อีกที)
+  width: 1280
+  height: 720
+  fps: 30
+
+model:
+  base_path: "models/active"  # Path สัมพัทธ์จาก root project
+  
+  box_detector:
+    enabled: true
+    weights: "box_model_production.pth"
+    onnx: "box_detector.onnx"
+    img_size: 640
+    conf_threshold: 0.50
+    padding_ratio: 0.10
+
+  pill_classifier:
+    enabled: true
+    weights: "pill_model_production.pth"
+    onnx: "pill_detector.onnx"
+    img_size: 384
+    conf_threshold: 0.65  # ค่าจากโค้ดเดิมของคุณ
+    
+ui:
+  zoom_level: 1.0
+  theme: "dark"
