@@ -30,6 +30,7 @@ runs/
 wandb/
 .dvc/
 *.sqlite3
+aws/dist/
 
 # --- Datasets ---
 data/
@@ -39,4 +40,4 @@ results/
 
 # --- OS System Files ---
 .DS_Store
-Thumbs.db
+Thumbs.dbaws/dist/
