@@ -1,0 +1,34 @@
+# === Python Essentials ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.env
+
+# === IDE & OS ===
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# === AI Models & Data (IMPORTANT!) ===
+# เราจะไม่เอาไฟล์โมเดลขนาดใหญ่ขึ้น Git (ให้แยกเก็บใน Cloud/S3)
+# แต่เราจะเว้น .gitkeep ไว้เพื่อให้ folder ไม่หาย
+models/*.pt
+models/*.pth
+models/*.onnx
+
+# Data folders
+datasets/
+runs/
+output/
+
+# === Config with Secrets ===
+# ถ้า settings.py มี password ให้ ignore แล้วสร้าง settings.example.py แทน
+# config/settings.py
+
+# === Logs ===
+*.log
