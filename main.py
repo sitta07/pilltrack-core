@@ -27,35 +27,42 @@ def get_real_cameras():
             if valid[i] > valid[i-1] + 1:
                 unique.append(valid[i])
     return unique
+from PyQt6.QtGui import QGuiApplication
 
 def main():
     app = QApplication(sys.argv)
     
-    # 1. โหลดทรัพยากรกลาง (Shared AI)
+    # ดึงข้อมูลหน้าจอทั้งหมดที่ระบบตรวจเจอ
+    screens = QGuiApplication.screens()
+    
     detector = ObjectDetector()
-    # พี่ใช้ RTX 5060 Ti แนะนำใช้ -seg เพื่อตัดพื้นหลังโหดๆ
     detector.load_model('models/yolov8n-seg.pt')
     processor = ImageProcessor()
 
-    # 2. ค้นหากล้อง
     active_cams = get_real_cameras()
-    print(f"✅ Found Cameras: {active_cams}")
-
     stations = []
-    # 3. สร้าง Station แยกตามจอ
+
     for i, cam_idx in enumerate(active_cams):
+        # ป้องกันกรณีจำนวนกล้องมากกว่าจำนวนหน้าจอ
+        screen_index = i if i < len(screens) else 0
+        target_screen = screens[screen_index]
+        screen_geometry = target_screen.geometry()
+
         win = StationWindow(i, cam_idx, detector, processor)
         
-        # ย้ายตำแหน่งไปตามจอ (0, 1920, 3840...)
-        x_pos = i * settings.MONITOR_WIDTH
-        win.move(x_pos, 0)
+        # ย้ายไปที่หน้าจอนั้นๆ โดยใช้พิกัดจาก System Geometry
+        win.move(screen_geometry.left(), screen_geometry.top())
         
-        # 🔥 สั่ง Full Screen ทันที
+        # บังคับขนาดให้เต็มหน้าจอตาม Geometry ของจอนั้นๆ
+        win.resize(screen_geometry.width(), screen_geometry.height())
+        
+        # ถ้าต้องการให้คลุม Taskbar ด้วย
         win.showFullScreen() 
+        
         stations.append(win)
 
-    print(f"🚀 PillTrack System is Ready on {len(stations)} Monitor(s).")
+    print(f"🚀 System Ready. Deployed on {len(stations)} Screen(s).")
     sys.exit(app.exec())
-
+    
 if __name__ == "__main__":
     main()
