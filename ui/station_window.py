@@ -1,113 +1,201 @@
 import cv2
 import numpy as np
-from PyQt6.QtWidgets import QMainWindow, QLabel, QVBoxLayout, QWidget, QHBoxLayout
+import time
+from PyQt6.QtWidgets import (
+    QMainWindow, QLabel, QVBoxLayout,
+    QWidget, QHBoxLayout
+)
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QImage, QPixmap, QFont
 
+
 class StationWindow(QMainWindow):
+
     def __init__(self, station_id, camera_idx, detector, processor):
         super().__init__()
+
         self.station_id = station_id
         self.detector = detector
         self.processor = processor
         self.camera_idx = camera_idx
-        
+
         from core.camera import CameraManager
         self.cam_mgr = CameraManager()
         self.cam_mgr.start(camera_idx)
 
+        # ====== MODE ======
+        self.mode = "PILL"   # PILL or BOX
+        self.start_time = time.time()
+        self.focus_phase = True  # 1 วิแรก focus boost
+
         self.init_ui()
 
-        # Timer สำหรับ Loop 30 FPS
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_logic)
-        self.timer.start(33) 
+        self.timer.start(33)
+
+    # ================= UI ================= #
 
     def init_ui(self):
-        """เน้น UI ที่สะอาดสำหรับใช้งานจริงในรพ."""
-        self.setStyleSheet("background-color: #0a0a0a; color: #ffffff;")
+        self.setWindowTitle("Pill Inspection Station")
+        self.setStyleSheet("background-color: black; color: white;")
+
+        # 🔥 เปิดมาเต็มจอเลย
+        self.showFullScreen()
+
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
 
-        # --- ฝั่งซ้าย: จอหลัก (ภาพสด Wide) ---
-        self.video_label = QLabel("Camera Feed")
+        # ===== LEFT: VIDEO =====
+        self.video_label = QLabel()
         self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.video_label.setStyleSheet("border: 1px solid #333; background-color: black;")
-        main_layout.addWidget(self.video_label, stretch=7)
+        main_layout.addWidget(self.video_label, stretch=8)
 
-        # --- ฝั่งขวา: ผลการวิเคราะห์ ---
+        # ===== RIGHT PANEL =====
         right_panel = QVBoxLayout()
-        
-        header = QLabel(f"STATION {self.station_id + 1}")
-        header.setFont(QFont("Arial", 24, QFont.Weight.Bold))
-        header.setStyleSheet("color: #00ff00; margin-bottom: 10px;")
-        right_panel.addWidget(header)
 
-        # ภาพ Crop เม็ดยา (ตัด BG)
+        self.header = QLabel()
+        self.header.setFont(QFont("Arial", 22, QFont.Weight.Bold))
+        right_panel.addWidget(self.header)
+
         self.pill_display = QLabel("No Object")
         self.pill_display.setFixedSize(300, 300)
-        self.pill_display.setStyleSheet("border: 2px dashed #444; background-color: #000; border-radius: 10px;")
         self.pill_display.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.pill_display.setStyleSheet(
+            "border: 2px dashed #444; background:black;"
+        )
         right_panel.addWidget(self.pill_display)
 
-        self.info_label = QLabel("สถานะ: รอยาวางบนถาด...")
+        self.info_label = QLabel("กำลังเริ่มระบบ...")
         self.info_label.setFont(QFont("Arial", 14))
-        self.info_label.setStyleSheet("background-color: #1a1a1a; padding: 15px; border-radius: 10px;")
         right_panel.addWidget(self.info_label)
 
-        # คำแนะนำสั้นๆ
-        footer = QLabel("กด [Esc] ย่อ/ขยายจอ | [Q] ปิด")
-        footer.setStyleSheet("color: #666; font-size: 10pt;")
-        right_panel.addWidget(footer)
-
         right_panel.addStretch()
-        main_layout.addLayout(right_panel, stretch=3)
+        main_layout.addLayout(right_panel, stretch=2)
+
+    # ================= KEY ================= #
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Escape:
-            self.showNormal() if self.isFullScreen() else self.showFullScreen()
-        elif event.key() == Qt.Key.Key_Q:
+        if event.key() == Qt.Key.Key_Q:
             self.close()
 
-    def update_logic(self):
-        """ดึงภาพมาประมวลผล (ไม่มีการสั่งซูมใน Loop นี้แล้ว)"""
-        frame = self.cam_mgr.get_frame()
-        if frame is None: return
+        elif event.key() == Qt.Key.Key_M:
+            self.toggle_mode()
 
-        # 🔥 ส่งภาพดิบเข้า AI เลย (ไม่ผ่าน apply_filters ที่แอบมี digital zoom)
+        elif event.key() == Qt.Key.Key_Escape:
+            self.showNormal()
+
+    def toggle_mode(self):
+        previous_mode = self.mode
+        self.mode = "BOX" if self.mode == "PILL" else "PILL"
+
+        if self.mode == "PILL":
+            # เข้าโหมด Pill → ซูมเข้า
+            self.cam_mgr.initialize_zoom(80)  # ปรับได้ 70–90 ตามต้องการ
+            self.start_time = time.time()
+            self.focus_phase = True
+
+        else:
+            # เข้าโหมด BOX → ซูมออก
+            self.cam_mgr.initialize_zoom(50)
+
+        self.info_label.setText(f"สลับโหมด → {self.mode}")
+
+
+    # ================= DIGITAL ZOOM ================= #
+
+    def digital_zoom(self, frame, zoom_factor):
+        if zoom_factor <= 1.0:
+            return frame
+
+        h, w = frame.shape[:2]
+        new_w = int(w / zoom_factor)
+        new_h = int(h / zoom_factor)
+
+        x1 = (w - new_w) // 2
+        y1 = (h - new_h) // 2
+
+        cropped = frame[y1:y1+new_h, x1:x1+new_w]
+        return cv2.resize(cropped, (w, h))
+
+    # ================= LOOP ================= #
+
+    def update_logic(self):
+        frame = self.cam_mgr.get_frame()
+        if frame is None:
+            return
+
+        elapsed = time.time() - self.start_time
+
+        # ===== Phase 1: Initial Deep Focus (1 sec) =====
+        if self.focus_phase:
+            frame = self.digital_zoom(frame, 2.0)  # ซูมลึก
+            if elapsed > 1.0:
+                self.focus_phase = False
+                self.info_label.setText("ระบบพร้อมทำงาน")
+        else:
+            # ===== Mode-based Zoom =====
+            if self.mode == "PILL":
+                frame = self.digital_zoom(frame, 2)
+            else:
+                frame = frame  # BOX = no zoom
+
+        # ===== AI Detection =====
         box, mask = self.detector.predict(frame, conf=0.1)
 
         if box is not None:
             conf = float(box.conf[0])
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-            
-            # วาดกรอบแค่ให้รู้ว่าเจอ (เขียว)
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-            # ตัด Background (AI Seg)
             if mask is not None:
                 pill_cutout = self.processor.cutout_by_mask(frame, box, mask)
                 if pill_cutout is not None:
                     self.display_pill(pill_cutout, conf)
-        
-        # แสดงภาพสด (Wide)
+
         self.display_main_video(frame)
+        self.update_header()
+
+    # ================= DISPLAY ================= #
 
     def display_main_video(self, frame):
-        rgb_img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb_img.shape
-        qt_img = QImage(rgb_img.data, w, h, ch * w, QImage.Format.Format_RGB888)
-        self.video_label.setPixmap(QPixmap.fromImage(qt_img).scaled(
-            self.video_label.size(), Qt.AspectRatioMode.KeepAspectRatio))
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+
+        qt_img = QImage(rgb.data, w, h, ch*w, QImage.Format.Format_RGB888)
+        pixmap = QPixmap.fromImage(qt_img)
+
+        scaled = pixmap.scaled(
+            self.video_label.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
+        )
+
+        self.video_label.setPixmap(scaled)
 
     def display_pill(self, pill_img, conf):
-        rgb_pill = cv2.cvtColor(pill_img, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb_pill.shape
-        qt_pill = QImage(rgb_pill.data, w, h, ch * w, QImage.Format.Format_RGB888)
-        self.pill_display.setPixmap(QPixmap.fromImage(qt_pill).scaled(
-            self.pill_display.size(), Qt.AspectRatioMode.KeepAspectRatio))
-        self.info_label.setText(f"<b>ตรวจพบวัตถุ</b><br>ความมั่นใจ: {conf:.2f}")
+        rgb = cv2.cvtColor(pill_img, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+
+        qt_img = QImage(rgb.data, w, h, ch*w, QImage.Format.Format_RGB888)
+        pixmap = QPixmap.fromImage(qt_img)
+
+        scaled = pixmap.scaled(
+            300, 300,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
+        )
+
+        self.pill_display.setPixmap(scaled)
+        self.info_label.setText(f"พบวัตถุ | Conf: {conf:.2f}")
+
+    def update_header(self):
+        self.header.setText(
+            f"STATION {self.station_id + 1} | MODE: {self.mode}"
+        )
+
+    # ================= CLOSE ================= #
 
     def closeEvent(self, event):
         self.cam_mgr.stop()

@@ -5,6 +5,17 @@ import time
 class CameraManager:
     def __init__(self):
         self.cap = None
+        
+    def initialize_zoom(self, value=50):
+        if self.cap and self.cap.isOpened():
+            try:
+                self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
+                self.cap.set(cv2.CAP_PROP_ZOOM, value)
+                current = self.cap.get(cv2.CAP_PROP_ZOOM)
+                print(f"🔍 Hardware zoom set to {current}")
+            except:
+                print("⚠️ Zoom control failed")
+
 
     def start(self, idx=0):
         if self.cap: self.cap.release()
@@ -17,12 +28,13 @@ class CameraManager:
         if self.cap.isOpened():
             # 🛑 สั่ง Wide สุดครั้งเดียวจบ (Hardware)
             try:
-                self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1) # ให้มันหาโฟกัสเองตอนเริ่ม
-                self.cap.set(cv2.CAP_PROP_ZOOM, -100)   # บังคับซูมออก Wide สุด
+                self.initialize_zoom(50)  # Wide สุด
+
                 print(f"✅ Camera {idx}: Hardware Zoom locked at Wide.")
             except: pass
             return True
         return False
+
 
     def get_frame(self):
         if self.cap and self.cap.isOpened():
