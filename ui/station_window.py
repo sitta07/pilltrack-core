@@ -114,12 +114,12 @@ class StationWindow(QMainWindow):
 
         if self.mode == "PILL":
             # Hardware Zoom & Focus Logic
-            self.cam_mgr.initialize_zoom(80)  
+            self.cam_mgr.initialize_zoom(60)  
             self.start_time = time.time()
             self.focus_phase = True
         else:
             # Hardware Zoom
-            self.cam_mgr.initialize_zoom(50)
+            self.cam_mgr.initialize_zoom(57)
             self.focus_phase = False # Box Mode ไม่ต้องใช้ Focus Phase
 
         self.info_label.setText(f"Switch Mode: {previous_mode} -> {self.mode}")
@@ -163,7 +163,7 @@ class StationWindow(QMainWindow):
                 frame = frame 
 
         # ===== AI Detection =====
-        box, mask = self.detector.predict(frame, conf=0.25)
+        box, mask = self.detector.predict(frame, conf=0.1)
 
         if box is not None:
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)

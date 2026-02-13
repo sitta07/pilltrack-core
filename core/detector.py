@@ -8,32 +8,34 @@ class ObjectDetector:
         self.model = None
 
     def load_model(self, model_path):
-        # ถ้าพี่อยากได้ละเอียดกริบๆ ให้เปลี่ยน n เป็น s หรือ m (yolov8s-seg.pt)
-        # แต่ถ้าเอาเร็วจัดๆ ใช้ n เหมือนเดิม (yolov8n-seg.pt)
-        seg_model_path = model_path.replace('.pt', '-seg.pt') # บังคับใช้ตัว seg
+        # 1. แก้ Logic การโหลดไฟล์: ไม่บังคับแก้ชื่อไฟล์เป็น -seg.pt แล้ว
+        # เพื่อให้รองรับ .onnx หรือไฟล์ชื่ออื่นๆ ที่ส่งเข้ามาตรงๆ
         
         try:
-            # task='segment' คือหัวใจสำคัญ
-            self.model = YOLO(seg_model_path, task='segment') 
-            return True, f"Loaded SEGMENTATION model: {seg_model_path}"
+            # task='detect' คือหัวใจสำคัญสำหรับ yolov8n.onnx (Detection)
+            # ถ้าโหลด onnx ไม่ต้องระบุ device ตรงนี้ Ultralytics จะจัดการเอง
+            self.model = YOLO(model_path, task='detect') 
+            return True, f"Loaded DETECTION model: {model_path}"
         except Exception as e:
-            # ถ้าไม่มีไฟล์ เดี๋ยว Ultralytics มันโหลดให้เอง
+            # Fallback: ถ้าโหลดไม่ได้ ให้กลับไปใช้ default
             try:
-                self.model = YOLO('yolov8n-seg.pt', task='segment')
-                return True, "Loaded Default yolov8n-seg.pt"
+                print(f"Error loading {model_path}: {e}, switching to default.")
+                self.model = YOLO('yolov8n.onnx', task='detect')
+                return True, "Loaded Default yolov8n.onnx"
             except Exception as e2:
                 return False, str(e2)
 
     def predict(self, frame, conf=0.1):
         if self.model is None: return None, None
         
-        # device=0 คือบังคับใช้ RTX 5060 Ti ของพี่
+        # 2. แก้ Predict: ตัด retina_masks ออก เพราะ ONNX Detection ไม่ใช้
+        # device=0 ถ้าใช้ ONNX Runtime GPU ได้มันจะใช้เอง แต่ถ้าไม่มีมันจะวิ่ง CPU
         results = self.model.predict(
             source=frame, 
             conf=conf, 
             verbose=False, 
-            device=0, 
-            retina_masks=True # 🔥 เปิดตัวนี้เพื่อ Mask คมกริบ (กิน GPU นิดนึงแต่พี่ไหวอยู่แล้ว)
+            device=0,
+            # retina_masks=True  <-- ลบบรรทัดนี้ออก เพราะ Detection ไม่มี Mask
         )
         
         if results and results[0].boxes:
@@ -42,10 +44,10 @@ class ObjectDetector:
             
             box = results[0].boxes[best_idx]
             
-            # ดึง Mask ออกมา (ถ้ามี)
+            # 3. Handle Mask: กรณี Detection จะไม่มี Mask (เป็น None)
             mask = None
-            if results[0].masks is not None:
-                # masks.data จะได้ mask ของทั้งภาพ
+            if hasattr(results[0], 'masks') and results[0].masks is not None:
+                # เผื่ออนาคตกลับมาใช้ model seg ก็ยังทำงานได้
                 mask = results[0].masks.data[best_idx]
                 
             return box, mask

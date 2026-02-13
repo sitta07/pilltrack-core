@@ -44,6 +44,7 @@ class ImageProcessor:
         """
         🔥 Highlight: ตัดพื้นหลังโดยใช้ AI Mask (GPU Accelerated)
         """
+        # Safety First: ถ้าไม่มี Box หรือ Mask (เช่นโหมด Detection) ให้ Return None หรือภาพเปล่าๆ
         if box is None or mask_tensor is None:
             return None
 
@@ -55,14 +56,17 @@ class ImageProcessor:
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w_img, x2), min(h_img, y2)
         
-        # ถ้ากล่องมีขนาดเป็น 0 ให้ข้าม
+        # ถ้ากล่องมีขนาดผิดปกติ ให้ข้าม
         if x2 - x1 <= 0 or y2 - y1 <= 0: return None
 
-        # 2. Process Mask (ทำงานบน GPU หรือ CPU ตาม Tensor ที่ส่งมา)
-        # Resize Mask ให้เท่ากับขนาดภาพจริง (Original Frame Size)
-        # mask_tensor ปกติจะขนาดเล็กกว่าภาพจริง เราต้องขยาย
-        mask_expanded = mask_tensor.unsqueeze(0).unsqueeze(0) # เพิ่ม dimension เพื่อ interpolate
+        # 2. Process Mask (แก้ Error ตรงนี้!)
+        # ✅ Must Convert to Float: bilinear ต้องการ float เท่านั้น
+        mask_float = mask_tensor.float() 
+
+        # เพิ่ม dimension เพื่อ interpolate (N, C, H, W)
+        mask_expanded = mask_float.unsqueeze(0).unsqueeze(0) 
         
+        # Resize Mask ให้เท่ากับขนาดภาพจริง
         mask_resized = F.interpolate(
             mask_expanded, 
             size=(h_img, w_img), 
@@ -70,22 +74,24 @@ class ImageProcessor:
             align_corners=False
         ).squeeze() # เอา dimension ที่เกินออก
 
-        # 3. ตัดเฉพาะส่วนกล่อง (ROI) เพื่อลดภาระการคำนวณ
-        # แปลงเป็น Numpy ที่นี่ (Cpu)
+        # 3. ตัดเฉพาะส่วนกล่อง (ROI)
+        # ใช้ .cpu().numpy() เพื่อแปลงกลับมาใช้งานกับ OpenCV
         roi_mask = mask_resized[y1:y2, x1:x1+(x2-x1)].cpu().numpy()
         roi_image = original_frame[y1:y2, x1:x2]
 
-        # ทำให้เป็น Binary Mask (0 หรือ 1)
-        binary_mask = (roi_mask > 0.5).astype(np.uint8)
-
-        # 4. Check Size Consistency (กันเหนียวเผื่อปัดเศษไม่ตรงกัน 1px)
-        mh, mw = binary_mask.shape
+        # เช็คขนาดอีกทีกันเหนียว (บางทีการปัดเศษทำให้ size ไม่เท่ากันเป๊ะ)
+        mh, mw = roi_mask.shape
         ih, iw = roi_image.shape[:2]
+        
         if mh != ih or mw != iw:
-            binary_mask = cv2.resize(binary_mask, (iw, ih), interpolation=cv2.INTER_NEAREST)
+            # Resize mask ให้เท่ากับ image roi เป๊ะๆ
+            roi_mask = cv2.resize(roi_mask, (iw, ih), interpolation=cv2.INTER_NEAREST)
 
-        # 5. Apply Mask! (พื้นหลังจะเป็นสีดำ)
-        # ใช้ bitwise_and โดยมี mask กำกับ
+        # ทำให้เป็น Binary Mask (0 หรือ 255)
+        # แนะนำให้ใช้ 255 ไปเลยครับ ชัวร์กว่ากับ OpenCV
+        binary_mask = (roi_mask > 0.5).astype(np.uint8) * 255
+
+        # 4. Apply Mask! (พื้นหลังจะเป็นสีดำ)
         result = cv2.bitwise_and(roi_image, roi_image, mask=binary_mask)
         
         return result
@@ -107,6 +113,5 @@ class ImageProcessor:
         cv2.line(frame, (cx + gap, cy), (cx + length, cy), color, 2)
         cv2.line(frame, (cx, cy - length), (cx, cy - gap), color, 2)
         cv2.line(frame, (cx, cy + gap), (cx, cy + length), color, 2)
-        # จุดแดงตรงกลาง
         cv2.circle(frame, (cx, cy), 2, (0, 0, 255), -1) 
         return frame
